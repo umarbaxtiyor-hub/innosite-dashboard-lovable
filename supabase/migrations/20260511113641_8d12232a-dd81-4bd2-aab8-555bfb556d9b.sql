@@ -1,0 +1,26 @@
+
+TRUNCATE TABLE
+  public.zayavka_status_log,
+  public.project_zayavka,
+  public.material_receipts,
+  public.work_progress,
+  public.expenses,
+  public.brigade_payments,
+  public.employee_payments,
+  public.brigade_members,
+  public.brigades,
+  public.employees,
+  public.master_materials,
+  public.master_works,
+  public.boq_items,
+  public.supplier_contracts,
+  public.suppliers,
+  public.variations,
+  public.documents,
+  public.bot_messages,
+  public.telegram_sessions,
+  public.audit_log,
+  public.expense_categories,
+  public.user_project_access,
+  public.projects
+RESTART IDENTITY CASCADE;

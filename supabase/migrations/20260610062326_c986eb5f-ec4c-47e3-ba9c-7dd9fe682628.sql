@@ -1,0 +1,1 @@
+INSERT INTO public.role_permissions (role, path) VALUES ('finans', '/settings') ON CONFLICT DO NOTHING;

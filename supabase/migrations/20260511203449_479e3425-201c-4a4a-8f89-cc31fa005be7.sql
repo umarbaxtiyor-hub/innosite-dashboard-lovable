@@ -1,0 +1,1 @@
+ALTER TABLE public.project_zayavka ADD COLUMN IF NOT EXISTS excel_url text;

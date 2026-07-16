@@ -1,0 +1,2 @@
+UPDATE public.material_receipts SET zayavka_id='af3f7213-9baf-45a2-b7d2-260c4beccf0a' WHERE zayavka_id='ca648e8c-dfd9-4fa5-a32d-cd6c92185635';
+DELETE FROM public.project_zayavka WHERE id='ca648e8c-dfd9-4fa5-a32d-cd6c92185635';

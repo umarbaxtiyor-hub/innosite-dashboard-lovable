@@ -1,0 +1,283 @@
+
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-steel: var(--steel);
+  --color-steel-foreground: var(--steel-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 1rem; /* 16px */
+
+  /* Innosite Brand — LIGHT (default)
+     Qora ko'k #0F172A · To'q sariq #F97316 · Ochiq kulrang #F8FAFC */
+  --background: #F8FAFC;
+  --foreground: #0F172A;
+  --card: #FFFFFF;
+  --card-foreground: #0F172A;
+  --popover: #FFFFFF;
+  --popover-foreground: #0F172A;
+  --primary: #0F172A;
+  --primary-foreground: #FFFFFF;
+  --primary-hover: #1E293B;
+  --secondary: #EEF2F7;
+  --secondary-foreground: #0F172A;
+  --muted: #F1F5F9;
+  --muted-foreground: #475569;
+  --accent: #F97316;
+  --accent-foreground: #FFFFFF;
+  --steel: #0F172A;
+  --steel-foreground: #F8FAFC;
+  --destructive: #C45656;
+  --destructive-foreground: #FFFFFF;
+  --warning: #F97316;
+  --warning-foreground: #FFFFFF;
+  --success: #3F8A6A;
+  --success-foreground: #FFFFFF;
+  --border: #E2E8F0;
+  --input: #E2E8F0;
+  --ring: #F97316;
+  --chart-1: #0F172A;
+  --chart-2: #F97316;
+  --chart-3: #475569;
+  --chart-4: #94A3B8;
+  --chart-5: #3F8A6A;
+  --chart-6: #E11D48;
+  --chart-7: #8B5CF6;
+  --chart-8: #0EA5E9;
+  --sidebar: #0F172A;
+  --sidebar-foreground: #F8FAFC;
+  --sidebar-primary: #F97316;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #1E293B;
+  --sidebar-accent-foreground: #F8FAFC;
+  --sidebar-border: #1E293B;
+  --sidebar-ring: #F97316;
+
+  --budget-primary: #0F172A;
+  --budget-bg: #F1F5F9;
+  --budget-border: #E2E8F0;
+
+  /* Karta ramkasi — light: qora ko'k #0F172A, dark: to'q sariq */
+  --card-frame: #0F172A;
+}
+
+/* Light explicit (default ham shu) */
+.light {
+  --background: #F8FAFC;
+  --foreground: #0F172A;
+  --card: #FFFFFF;
+  --card-foreground: #0F172A;
+  --popover: #FFFFFF;
+  --popover-foreground: #0F172A;
+  --primary: #0F172A;
+  --primary-foreground: #FFFFFF;
+  --secondary: #EEF2F7;
+  --secondary-foreground: #0F172A;
+  --muted: #F1F5F9;
+  --muted-foreground: #475569;
+  --accent: #F97316;
+  --accent-foreground: #FFFFFF;
+  --steel: #0F172A;
+  --steel-foreground: #F8FAFC;
+  --destructive: #C45656;
+  --destructive-foreground: #FFFFFF;
+  --warning: #F97316;
+  --warning-foreground: #FFFFFF;
+  --success: #3F8A6A;
+  --success-foreground: #FFFFFF;
+  --border: #E2E8F0;
+  --input: #E2E8F0;
+  --ring: #F97316;
+  --sidebar: #0F172A;
+  --sidebar-foreground: #F8FAFC;
+  --sidebar-primary: #F97316;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #1E293B;
+  --sidebar-accent-foreground: #F8FAFC;
+  --sidebar-border: #1E293B;
+  --sidebar-ring: #F97316;
+  --card-frame: #0F172A;
+}
+
+.dark {
+  --background: #0F172A;
+  --foreground: #F8FAFC;
+  --card: #1E293B;
+  --card-foreground: #F8FAFC;
+  --popover: #1E293B;
+  --popover-foreground: #F8FAFC;
+  --primary: #F97316;
+  --primary-foreground: #0F172A;
+  --secondary: #1E293B;
+  --secondary-foreground: #F8FAFC;
+  --muted: #1E293B;
+  --muted-foreground: #94A3B8;
+  --accent: #F97316;
+  --accent-foreground: #0F172A;
+  --destructive: #DC6B6B;
+  --destructive-foreground: #FFFFFF;
+  --warning: #F97316;
+  --warning-foreground: #0F172A;
+  --success: #5BA88A;
+  --success-foreground: #0F172A;
+  --chart-1: #F8FAFC;
+  --chart-2: #F97316;
+  --chart-3: #94A3B8;
+  --chart-4: #64748B;
+  --chart-5: #5BA88A;
+  --chart-6: #FB7185;
+  --chart-7: #A78BFA;
+  --chart-8: #38BDF8;
+  --border: #1E293B;
+  --input: #1E293B;
+  --ring: #F97316;
+  --sidebar: #0B1120;
+  --sidebar-foreground: #F8FAFC;
+  --sidebar-primary: #F97316;
+  --sidebar-primary-foreground: #0F172A;
+  --sidebar-accent: #1E293B;
+  --sidebar-accent-foreground: #F8FAFC;
+  --sidebar-border: #1E293B;
+  --sidebar-ring: #F97316;
+  --card-frame: #F97316;
+}
+
+
+@layer base {
+  * { border-color: var(--color-border); }
+  html, body {
+    font-family: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-feature-settings: "ss01", "cv11";
+    font-weight: 400;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--color-foreground);
+  }
+  button, label {
+    font-weight: 600;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+
+  /* Subtle radial navy glow for hero/header areas */
+  .hero-glow {
+    background-image: radial-gradient(60% 80% at 50% 0%, rgba(59, 111, 160, 0.18) 0%, rgba(59, 111, 160, 0) 60%);
+  }
+
+  /* Pastel layered background — dashboard uchun yengil ranglar */
+  .pastel-canvas {
+    background-image:
+      radial-gradient(60% 50% at 0% 0%, color-mix(in oklab, var(--accent) 10%, transparent) 0%, transparent 60%),
+      radial-gradient(50% 50% at 100% 10%, color-mix(in oklab, #60a5fa 12%, transparent) 0%, transparent 60%),
+      radial-gradient(55% 45% at 80% 100%, color-mix(in oklab, #34d399 10%, transparent) 0%, transparent 60%);
+  }
+  .dark .pastel-canvas {
+    background-image:
+      radial-gradient(60% 50% at 0% 0%, color-mix(in oklab, var(--accent) 14%, transparent) 0%, transparent 60%),
+      radial-gradient(50% 50% at 100% 10%, color-mix(in oklab, #60a5fa 10%, transparent) 0%, transparent 60%),
+      radial-gradient(55% 45% at 80% 100%, color-mix(in oklab, #a78bfa 10%, transparent) 0%, transparent 60%);
+  }
+  .pastel-card-blue   { background: linear-gradient(135deg, color-mix(in oklab, #60a5fa 10%, var(--card)) 0%, var(--card) 100%); }
+  .pastel-card-green  { background: linear-gradient(135deg, color-mix(in oklab, #34d399 10%, var(--card)) 0%, var(--card) 100%); }
+  .pastel-card-orange { background: linear-gradient(135deg, color-mix(in oklab, var(--accent) 12%, var(--card)) 0%, var(--card) 100%); }
+  .pastel-card-violet { background: linear-gradient(135deg, color-mix(in oklab, #a78bfa 10%, var(--card)) 0%, var(--card) 100%); }
+
+  /* KPI kartalar — juda och pastel tint (light & dark). Ramka komponentda. */
+  .kpi-tint-green  { background: linear-gradient(135deg, color-mix(in oklab, #34d399 9%, var(--card)) 0%, var(--card) 85%); }
+  .kpi-tint-red    { background: linear-gradient(135deg, color-mix(in oklab, #f87171 9%, var(--card)) 0%, var(--card) 85%); }
+  .kpi-tint-blue   { background: linear-gradient(135deg, color-mix(in oklab, #60a5fa 9%, var(--card)) 0%, var(--card) 85%); }
+  .kpi-tint-violet { background: linear-gradient(135deg, color-mix(in oklab, #a78bfa 9%, var(--card)) 0%, var(--card) 85%); }
+  .kpi-tint-orange { background: linear-gradient(135deg, color-mix(in oklab, #fb923c 10%, var(--card)) 0%, var(--card) 85%); }
+  .kpi-tint-teal   { background: linear-gradient(135deg, color-mix(in oklab, #2dd4bf 9%, var(--card)) 0%, var(--card) 85%); }
+  .dark .kpi-tint-green  { background: linear-gradient(135deg, color-mix(in oklab, #34d399 14%, var(--card)) 0%, var(--card) 90%); }
+  .dark .kpi-tint-red    { background: linear-gradient(135deg, color-mix(in oklab, #f87171 14%, var(--card)) 0%, var(--card) 90%); }
+  .dark .kpi-tint-blue   { background: linear-gradient(135deg, color-mix(in oklab, #60a5fa 14%, var(--card)) 0%, var(--card) 90%); }
+  .dark .kpi-tint-violet { background: linear-gradient(135deg, color-mix(in oklab, #a78bfa 14%, var(--card)) 0%, var(--card) 90%); }
+  .dark .kpi-tint-orange { background: linear-gradient(135deg, color-mix(in oklab, #fb923c 15%, var(--card)) 0%, var(--card) 90%); }
+  .dark .kpi-tint-teal   { background: linear-gradient(135deg, color-mix(in oklab, #2dd4bf 14%, var(--card)) 0%, var(--card) 90%); }
+
+  /* Card hover lift used by .surface-card */
+  .surface-card {
+    background-color: var(--color-card);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    transition: transform 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+  }
+  .surface-card:hover {
+    border-color: rgba(59, 111, 160, 0.4);
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* iOS Safari: input/select/textarea fokusda avtomatik zoom qilmasin.
+   Buning uchun shrift hech bo'lmaganda 16px bo'lishi shart. */
+@media (max-width: 768px) {
+  input, select, textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* Sekin yonib-o'chuvchi animatsiya — loyiha tanlash tugmasi uchun */
+@keyframes slow-blink {
+  0%, 100% { opacity: 1; box-shadow: 0 0 28px rgba(249, 115, 22, 0.7); }
+  50% { opacity: 0.5; box-shadow: 0 0 12px rgba(249, 115, 22, 0.3); }
+}
+.animate-slow-blink {
+  animation: slow-blink 2.2s ease-in-out infinite;
+}

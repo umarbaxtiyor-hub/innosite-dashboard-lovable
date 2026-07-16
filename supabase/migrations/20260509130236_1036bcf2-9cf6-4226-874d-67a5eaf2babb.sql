@@ -1,0 +1,1 @@
+UPDATE public.profiles SET telegram_user_id = 667445762 WHERE id = 'a1e5ccf1-b180-4de4-88f9-27dbac71b836';

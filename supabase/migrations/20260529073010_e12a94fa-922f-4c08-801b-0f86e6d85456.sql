@@ -1,0 +1,1 @@
+UPDATE public.project_zayavka SET off_plan = false WHERE zayavka_no IS NULL AND parent_id IS NULL AND off_plan = true AND (notes IS NULL OR notes NOT LIKE '[AI taxmini]%');
