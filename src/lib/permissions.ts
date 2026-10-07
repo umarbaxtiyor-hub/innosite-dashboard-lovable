@@ -53,7 +53,6 @@ export const PAGE_PERMISSIONS: Record<string, AppRole[]> = {
   "/davomat":         ["admin", "ceo", "direktor", "pm", "prorab"],
   "/variations":      ["admin", "ceo", "direktor", "pm"],
   "/audit-log":       ["admin", "ceo", "direktor"],
-  "/ai-agent":        ["admin", "ceo", "direktor", "pm"],
   "/settings":        ["admin", "finans"],
 };
 
@@ -70,18 +69,27 @@ export function hasAnyRole(userRoles: string[], allowed: AppRole[]): boolean {
   return allowed.some((r) => userRoles.includes(r));
 }
 
+/** Web/mobil ilovaga faqat shu rollar kira oladi.
+ *  Qolgan rollar faqat Telegram bot orqali ishlaydi. */
+export const WEB_ROLES: AppRole[] = ["admin", "ceo", "finans"];
+
+export function canUseWebApp(userRoles: string[]): boolean {
+  return hasAnyRole(userRoles, WEB_ROLES);
+}
+
+/** CEO uchun yopiq bo'limlar (admin/finans ko'radi). */
+const CEO_DENIED_PATHS = ["/master-jadval", "/buxalteriya", "/settings"];
+
 export function canAccessPath(
   pathname: string,
   userRoles: string[],
-  matrix: Record<string, AppRole[]> = PAGE_PERMISSIONS,
+  _matrix: Record<string, AppRole[]> = PAGE_PERMISSIONS,
 ): boolean {
-  if (userRoles.includes("admin")) return true;
-  const exact = matrix[pathname];
-  if (exact) return hasAnyRole(userRoles, exact);
-  const keys = Object.keys(matrix)
-    .filter((k) => k !== "/" && pathname.startsWith(k + "/"))
-    .sort((a, b) => b.length - a.length);
-  if (keys.length > 0) return hasAnyRole(userRoles, matrix[keys[0]]);
+  if (!canUseWebApp(userRoles)) return false;
+  const isAdminOrFinans = userRoles.includes("admin") || userRoles.includes("finans");
+  if (!isAdminOrFinans && userRoles.includes("ceo")) {
+    if (CEO_DENIED_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"))) return false;
+  }
   return true;
 }
 
@@ -90,14 +98,12 @@ export const MANAGED_PAGES: Array<{ path: string; label: string }> = [
   { path: "/",                label: "Dashboard" },
   { path: "/master-zayavka",  label: "Smeta (B.O.Q)" },
   { path: "/master-jadval",   label: "Jurnal" },
-  
   { path: "/taminot",         label: "Ta'minot" },
   { path: "/buxalteriya",     label: "Buxgalteriya" },
   { path: "/brigade-balance", label: "Xodimlar / Brigada balansi" },
   { path: "/davomat",         label: "Davomat" },
   { path: "/variations",      label: "Qo'shimcha ishlar" },
   { path: "/audit-log",       label: "Audit log" },
-  { path: "/ai-agent",        label: "AI agent" },
   { path: "/settings",        label: "Sozlamalar" },
 ];
 

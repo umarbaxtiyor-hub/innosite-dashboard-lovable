@@ -109,11 +109,17 @@ export const useWork = (projectId?: string | null) =>
 
 export const useExpenses = (projectId?: string | null) =>
   useDb<DbExpense>(["expenses", projectId ?? "all"], async () => {
-    let q = supabase.from("expenses").select("*").order("expense_date", { ascending: false });
-    if (projectId) q = q.eq("project_id", projectId);
-    const { data, error } = await q;
-    if (error) throw error;
-    return (data ?? []) as DbExpense[];
+    // 1000 qatordan ko'p bo'lsa ham hammasi o'qiladi (jami summalar to'liq chiqishi uchun).
+    const out: DbExpense[] = [];
+    for (let f = 0; f < 200_000; f += 1000) {
+      let q = supabase.from("expenses").select("*").order("expense_date", { ascending: false }).order("id");
+      if (projectId) q = q.eq("project_id", projectId);
+      const { data, error } = await q.range(f, f + 999);
+      if (error) throw error;
+      out.push(...((data ?? []) as DbExpense[]));
+      if (!data || data.length < 1000) break;
+    }
+    return out;
   }, fallbackExpenses, { useFallback: !projectId });
 
 export const useVariations = (projectId?: string | null) =>
@@ -138,7 +144,12 @@ export const fmtUZSc = (n: number) => {
     return `${v.toFixed(abs >= 10_000_000_000 ? 1 : 2).replace(/\.?0+$/, "")} mlrd`;
   }
   if (abs >= 1_000_000) {
-    return `${Math.round(num / 1_000_000)} mln`;
+    const v = num / 1_000_000;
+    const decimals = abs >= 100_000_000 ? 0 : abs >= 10_000_000 ? 1 : 2;
+    return `${v.toFixed(decimals).replace(/\.?0+$/, "")} mln`;
+  }
+  if (abs >= 1_000) {
+    return `${Math.round(num / 1_000)}k`;
   }
   return fmtUZS(num);
 };

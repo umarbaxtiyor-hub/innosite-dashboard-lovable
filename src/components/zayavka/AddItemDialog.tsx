@@ -12,7 +12,7 @@ import { useActiveProject } from "@/lib/project-context";
 
 type BoqOpt = { id: string; code: string | null; name: string; kind: string };
 
-type Kind = "material" | "work" | "equipment";
+type Kind = "material" | "work" | "equipment" | "ustalar";
 
 export function AddItemDialog({
   onDone,
@@ -146,6 +146,7 @@ export function AddItemDialog({
                 <SelectContent>
                   <SelectItem value="material">📦 Material</SelectItem>
                   <SelectItem value="work">🔨 Ish turi</SelectItem>
+                  <SelectItem value="ustalar">👷 Ustalar</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -158,6 +159,7 @@ export function AddItemDialog({
                 <SelectContent>
                   <SelectItem value="material">📦 Material</SelectItem>
                   <SelectItem value="work">🔨 Ish turi</SelectItem>
+                  <SelectItem value="ustalar">👷 Ustalar</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -180,7 +182,7 @@ export function AddItemDialog({
                     .slice(0, 200)
                     .map((o) => (
                       <SelectItem key={o.id} value={o.id}>
-                        {o.kind === "material" ? "📦" : "🔨"} {o.name.length > 60 ? o.name.slice(0, 58) + "…" : o.name}
+                        {o.kind === "material" ? "📦" : o.kind === "ustalar" ? "👷" : "🔨"} {o.name.length > 60 ? o.name.slice(0, 58) + "…" : o.name}
                       </SelectItem>
                     ))}
                 </SelectContent>

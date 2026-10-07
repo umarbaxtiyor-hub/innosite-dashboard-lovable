@@ -138,13 +138,9 @@ function AuthPage() {
             {mode === "login" ? "Kirish" : "Ro'yxatdan o'tish"}
           </Button>
         </form>
-        <button
-          type="button"
-          onClick={() => setMode(mode === "login" ? "signup" : "login")}
-          className="text-xs text-primary hover:underline"
-        >
-          {mode === "login" ? "Hisobingiz yo'qmi? Ro'yxatdan o'ting" : "Hisobingiz bormi? Kiring"}
-        </button>
+        <p className="text-xs text-muted-foreground">
+          Hisobingiz yo'qmi? Ro'yxatdan o'tish faqat @Finance_tizim_bot orqali — admin tasdiqlagach PIN beriladi.
+        </p>
       </Card>
     </div>
   );

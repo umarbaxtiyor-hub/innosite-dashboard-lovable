@@ -2,8 +2,9 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as XLSX from "xlsx";
-import { Download, Search, ArrowUp, ArrowDown, ArrowUpDown, Tag, CalendarDays } from "lucide-react";
+import { Download, Search, ArrowUp, ArrowDown, ArrowUpDown, Tag, Layers, CalendarDays, Trash2, Pencil, Save, X } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { toast } from "sonner";
 
 import { PageHeader } from "@/components/PageHeader";
 import { Card } from "@/components/ui/card";
@@ -16,6 +17,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import { supabase } from "@/integrations/supabase/client";
+import { EXPENSE_KIND_LABELS, kindForCategory, categoriesForKind, EXPENSE_KINDS, isMaterialMirrorExpense, type ExpenseKind } from "@/lib/boq-category-map";
 import { useActiveProject } from "@/lib/project-context";
 import { fmtUZS, fmtUZSc } from "@/lib/queries";
 import { AddExpenseDialog } from "@/components/AddExpenseDialog";
@@ -31,6 +33,17 @@ export const Route = createFileRoute("/master-jadval")({
   }),
   component: MasterJadvalPage,
 });
+
+function invalidateAll(qc: ReturnType<typeof useQueryClient>) {
+  const keys = [
+    "master-jadval", "project-kpis-v3", "dashboard-real-spend", "dashboard-plan-vs-fact",
+    "dashboard-daily-spend", "weekly-activity", "weekly-expense-trend", "red-flags",
+    "global-finance", "exec-overview", "brigade-top-balances", "boq", "boq_items", "smeta",
+    "material_receipts", "work_progress", "project_zayavka", "expenses", "incomes",
+    "brigade_payments", "materials", "work", "variations",
+  ];
+  for (const k of keys) qc.invalidateQueries({ queryKey: [k] });
+}
 
 type Row = {
   id: string;
@@ -95,6 +108,19 @@ function srcLabel(s?: string | null, hasTg?: boolean) {
 
 const UZ_MONTHS = ["Yanvar","Fevral","Mart","Aprel","May","Iyun","Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"];
 
+async function fetchAllRows<T>(buildQuery: (from: number, to: number) => any, pageSize = 1000): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += pageSize) {
+    const to = from + pageSize - 1;
+    const { data, error } = await buildQuery(from, to);
+    if (error) throw error;
+    const rows = (data ?? []) as T[];
+    all.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return all;
+}
+
 function fmtUz(d?: string | null) {
   if (!d) return "—";
   const s = d.slice(0, 10);
@@ -124,6 +150,7 @@ function MasterJadvalPage() {
   const [cat, setCat] = useState<string>("all");
   const [month, setMonth] = useState<string>("all");
   const [day, setDay] = useState<string>("");
+  const [kind, setKind] = useState<string>("all");
   const [sortKey, setSortKey] = useState<"date" | "category" | "name" | "total">("date");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [openRow, setOpenRow] = useState<Row | null>(null);
@@ -152,7 +179,7 @@ function MasterJadvalPage() {
 
   // Live: invalidate jurnal query when any source table changes (incl. plan status)
   useEffect(() => {
-    const invalidate = () => qc.invalidateQueries({ queryKey: ["master-jadval"] });
+    const invalidate = () => invalidateAll(qc);
     const ch = supabase
       .channel("master-jadval-live")
       .on("postgres_changes", { event: "*", schema: "public", table: "project_zayavka" }, invalidate)
@@ -179,21 +206,33 @@ function MasterJadvalPage() {
         (allProjects ?? []).map((p: any) => [p.id, p.name]),
       );
       const projFilter = activeProjectId ? activeProjectId : null;
-      const eq = (b: any) => (projFilter ? b.eq("project_id", projFilter) : b);
-
-
       const [mat, work, exp, bp, inc] = await Promise.all([
-        eq(supabase.from("material_receipts").select("*")),
-        eq(supabase.from("work_progress").select("*")),
-        eq(supabase.from("expenses").select("*")),
-        eq(supabase.from("brigade_payments").select("*")),
-        eq(supabase.from("incomes").select("*")),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("material_receipts").select("*");
+          return (projFilter ? q.eq("project_id", projFilter) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("work_progress").select("*");
+          return (projFilter ? q.eq("project_id", projFilter) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("expenses").select("*");
+          return (projFilter ? q.eq("project_id", projFilter) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("brigade_payments").select("*");
+          return (projFilter ? q.eq("project_id", projFilter) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("incomes").select("*");
+          return (projFilter ? q.eq("project_id", projFilter) : q).range(from, to);
+        }),
       ]);
 
       // Collect referenced zayavka ids and fetch in one query
       const zIds = new Set<string>();
-      for (const arr of [mat.data, work.data, exp.data]) {
-        for (const r of (arr ?? []) as any[]) if (r.zayavka_id) zIds.add(r.zayavka_id);
+      for (const arr of [mat, work, exp]) {
+        for (const r of arr as any[]) if (r.zayavka_id) zIds.add(r.zayavka_id);
       }
       const zMap = new Map<string, { no: number | null; name: string; status: string | null }>();
       if (zIds.size) {
@@ -215,8 +254,8 @@ function MasterJadvalPage() {
       // Collect user identifiers for "Kim" lookup (telegram_user_id / created_by)
       const tgIds = new Set<number>();
       const uids = new Set<string>();
-      for (const arr of [mat.data, work.data, exp.data, bp.data, inc.data]) {
-        for (const r of (arr ?? []) as any[]) {
+      for (const arr of [mat, work, exp, bp, inc]) {
+        for (const r of arr as any[]) {
           if (r.telegram_user_id) tgIds.add(Number(r.telegram_user_id));
           if (r.created_by) uids.add(r.created_by);
         }
@@ -249,7 +288,7 @@ function MasterJadvalPage() {
 
       const out: Row[] = [];
 
-      for (const r of (mat.data ?? []) as any[]) {
+      for (const r of mat as any[]) {
         const total = Number(r.total_price) || (Number(r.qty) * Number(r.unit_price)) || 0;
         const src = r.source ?? (r.telegram_user_id ? "telegram_text" : "web");
         out.push({
@@ -265,7 +304,7 @@ function MasterJadvalPage() {
           raw: r,
         });
       }
-      for (const r of (work.data ?? []) as any[]) {
+      for (const r of work as any[]) {
         const total = Number(r.total_value) || (Number(r.qty_done) * Number(r.unit_price)) || 0;
         const src = r.source ?? (r.telegram_user_id ? "telegram_text" : "web");
         out.push({
@@ -281,16 +320,20 @@ function MasterJadvalPage() {
           raw: r,
         });
       }
-      for (const r of (exp.data ?? []) as any[]) {
+      for (const r of exp as any[]) {
         const total = Number(r.amount) || 0;
         const src = r.source ?? (r.telegram_user_id ? "telegram_text" : "web");
+        const isMirrored = isMaterialMirrorExpense(r);
+        const expKind = (r.kind as string) || kindForCategory(r.category);
+        const kindLabel = (EXPENSE_KIND_LABELS as Record<string, string>)[expKind] ?? "Operatsion";
         out.push({
           id: `exp:${r.id}`,
-          date: r.expense_date, category: r.category || "Xarajat", kind: "xarajat",
+          date: r.expense_date, category: r.category || "Xarajat", kind: kindLabel,
           name: r.description || r.category || "Xarajat",
           unit: r.unit, qty: Number(r.qty) || null,
           unit_price: Number(r.unit_price) || null, total,
-          in_amount: 0, out_amount: total,
+          // BOQ yozuvi material/ish jadvalida ham mavjud bo'ladi; ikki marta sanamaymiz.
+          in_amount: 0, out_amount: isMirrored ? 0 : total,
           who: resolveWho(r, r.paid_by), project: projectsMap.get(r.project_id) ?? null,
           source: src, source_label: srcLabel(src, !!r.telegram_user_id),
           note: r.source_note ?? r.description,
@@ -298,7 +341,7 @@ function MasterJadvalPage() {
           raw: r,
         });
       }
-      for (const r of (bp.data ?? []) as any[]) {
+      for (const r of bp as any[]) {
         const total = Number(r.amount) || 0;
         const src = r.source ?? (r.telegram_user_id ? "telegram_text" : "web");
         out.push({
@@ -314,7 +357,7 @@ function MasterJadvalPage() {
         });
       }
 
-      for (const r of (inc.data ?? []) as any[]) {
+      for (const r of inc as any[]) {
         const total = Number(r.amount) || 0;
         const src = r.source ?? (r.telegram_user_id ? "telegram_text" : "web");
         const cat = `Kirim (${r.payment_method ?? "Naqd"})`;
@@ -349,6 +392,14 @@ function MasterJadvalPage() {
   const filtered = useMemo(() => {
     const ql = q.trim().toLowerCase();
     return rows.filter((r) => {
+      if (kind !== "all") {
+        if (kind === "kirim") {
+          if (r.kind !== "kirim") return false;
+        } else {
+          const rk = (r.raw?.kind as string) || kindForCategory(r.category);
+          if ((EXPENSE_KIND_LABELS as Record<string, string>)[rk] !== kind && rk !== kind) return false;
+        }
+      }
       if (cat !== "all" && r.category !== cat) return false;
       if (day) {
         if (r.date?.slice(0, 10) !== day) return false;
@@ -360,10 +411,12 @@ function MasterJadvalPage() {
       return (
         (r.name ?? "").toLowerCase().includes(ql) ||
         (r.who ?? "").toLowerCase().includes(ql) ||
-        (r.note ?? "").toLowerCase().includes(ql)
+        (r.note ?? "").toLowerCase().includes(ql) ||
+        (r.category ?? "").toLowerCase().includes(ql) ||
+        (r.kind ?? "").toLowerCase().includes(ql)
       );
     });
-  }, [rows, q, cat, month, day]);
+  }, [rows, q, cat, kind, month, day]);
 
   const sorted = useMemo(() => {
     const arr = [...filtered];
@@ -388,7 +441,7 @@ function MasterJadvalPage() {
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
   const safePage = Math.min(page, totalPages - 1);
-  useEffect(() => { setPage(0); }, [q, cat, month, day, sortKey, sortDir, pageSize]);
+  useEffect(() => { setPage(0); }, [q, cat, kind, month, day, sortKey, sortDir, pageSize]);
   const paged = useMemo(
     () => sorted.slice(safePage * pageSize, safePage * pageSize + pageSize),
     [sorted, safePage, pageSize],
@@ -396,10 +449,11 @@ function MasterJadvalPage() {
 
 
   const totals = useMemo(() => {
-    return filtered.reduce(
+    return rows.reduce(
       (a, r) => {
         // Shartnoma kirimi balansga kirmaydi (kassaga ta'sir qilmaydi)
-        const isContract = r.kind === "kirim" && String(r.raw?.category ?? "").toLowerCase().includes("shartnoma");
+        const incomeCategory = String(r.raw?.category ?? "").toLowerCase();
+        const isContract = r.kind === "kirim" && (incomeCategory.includes("shartnoma") || incomeCategory.includes("kontrak"));
         return {
           kirim: a.kirim + (isContract ? 0 : r.in_amount),
           chiqim: a.chiqim + r.out_amount,
@@ -408,19 +462,28 @@ function MasterJadvalPage() {
       },
       { kirim: 0, chiqim: 0, count: 0 },
     );
-  }, [filtered]);
+  }, [rows]);
 
   const incomesAll = useMemo(() => filtered.filter((r) => r.kind === "kirim"), [filtered]);
 
-  const PREDEFINED_CATS = [
-    "Material (BOQ)", "Ish (BOQ)", "Qo'shimcha (BOQ)",
-    "Bozorlik", "Transport", "Yordamchi", "Xodimlar", "Boshqa",
-    "Kirim (Naqd)", "Kirim (Bank)", "Kirim (Plastik)", "Kirim (O'tkazma)", "Kirim (Hisob)",
-  ];
-  const categories = useMemo(
-    () => Array.from(new Set([...PREDEFINED_CATS, ...rows.map((r) => r.category)])).sort(),
-    [rows],
-  );
+  const { data: dbCategories = [] } = useQuery({
+    queryKey: ["expense_categories_list"],
+    queryFn: async () => {
+      const { data } = await supabase.from("expense_categories").select("name").order("name");
+      return (data ?? []).map((r: any) => r.name as string);
+    },
+    staleTime: 60_000,
+  });
+  const categories = useMemo(() => {
+    const present = new Set(rows.map((r) => r.category).filter(Boolean));
+    const merged = new Set<string>();
+    dbCategories.forEach((c) => merged.add(String(c)));
+    present.forEach((c) => merged.add(String(c)));
+    return Array.from(merged)
+      .filter((c) => String(c).trim().length > 0)
+      .filter((c) => !/\(boq\)/i.test(String(c)))
+      .sort((a, b) => a.localeCompare(b, "uz"));
+  }, [rows, dbCategories]);
 
 
   function exportExcel() {
@@ -490,6 +553,43 @@ function MasterJadvalPage() {
     XLSX.writeFile(wb, `jurnal-${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
+  async function deleteAllFiltered() {
+    if (!filtered.length) return;
+    const tableFor = (id: string): string | null => {
+      const p = id.split(":")[0];
+      return ({ mat: "material_receipts", work: "work_progress", exp: "expenses", bp: "brigade_payments", inc: "incomes" } as Record<string, string>)[p] ?? null;
+    };
+    const grouped = new Map<string, string[]>();
+    for (const r of filtered) {
+      const t = tableFor(r.id);
+      const raw = r.id.split(":")[1];
+      if (!t || !raw) continue;
+      if (!grouped.has(t)) grouped.set(t, []);
+      grouped.get(t)!.push(raw);
+    }
+    const total = Array.from(grouped.values()).reduce((s, a) => s + a.length, 0);
+    if (!total) return;
+    const msg = `DIQQAT! ${total} ta yozuv butunlay o'chiriladi. Davom etilsinmi?`;
+    if (!window.confirm(msg)) return;
+    if (!window.confirm("Rostdan ham o'chirmoqchimisiz? Bu amalni qaytarib bo'lmaydi.")) return;
+    const t = toast.loading(`O'chirilmoqda... (0/${total})`);
+    let done = 0;
+    let failed = 0;
+    for (const [table, ids] of grouped) {
+      const chunkSize = 100;
+      for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize);
+        const { error } = await supabase.from(table as any).delete().in("id", chunk);
+        if (error) failed += chunk.length;
+        else done += chunk.length;
+        toast.loading(`O'chirilmoqda... (${done}/${total})`, { id: t });
+      }
+    }
+    if (failed) toast.error(`${done} ta o'chirildi, ${failed} ta xato`, { id: t });
+    else toast.success(`${done} ta yozuv o'chirildi`, { id: t });
+    invalidateAll(qc);
+  }
+
   if (!activeProjectId) {
     return (
       <div className="space-y-3 p-3 sm:p-4">
@@ -511,6 +611,11 @@ function MasterJadvalPage() {
             {showAmount && (
               <Button variant="outline" size="sm" onClick={exportExcel} disabled={!filtered.length}>
                 <Download className="mr-1 h-3.5 w-3.5" /> Excel
+              </Button>
+            )}
+            {canEdit && (
+              <Button variant="destructive" size="sm" onClick={deleteAllFiltered} disabled={!filtered.length}>
+                <Trash2 className="mr-1 h-3.5 w-3.5" /> Hammasini o'chirish
               </Button>
             )}
           </div>
@@ -538,18 +643,18 @@ function MasterJadvalPage() {
       )}
 
       <div className="space-y-3">
-        <div className="flex flex-row items-center gap-1.5">
-          <div className="relative flex-1 min-w-0">
+        <div className="flex w-full min-w-0 flex-row items-center gap-1.5">
+          <div className="relative min-w-0 flex-1 basis-0">
             <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               placeholder="Qidirish..."
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              className="h-9 rounded-xl border-0 bg-muted/50 pl-8 text-sm shadow-sm focus-visible:ring-1"
+              className="h-9 w-full rounded-xl border-0 bg-muted/50 pl-8 text-sm shadow-sm focus-visible:ring-1"
             />
           </div>
           <Select value={cat} onValueChange={setCat}>
-            <SelectTrigger className="h-9 w-[132px] shrink-0 justify-start rounded-xl border-0 bg-muted/50 pl-2 pr-2 text-xs shadow-sm [&>svg:last-child]:hidden gap-1.5">
+            <SelectTrigger className="h-9 w-[104px] shrink-0 justify-start overflow-hidden rounded-xl border-0 bg-muted/50 pl-2 pr-2 text-xs shadow-sm [&>svg:last-child]:hidden gap-1.5 [&>span]:truncate sm:w-[132px]">
               <Tag className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <SelectValue placeholder="Kategoriya" />
             </SelectTrigger>
@@ -558,8 +663,20 @@ function MasterJadvalPage() {
               {categories.map((c) => (<SelectItem key={c} value={c}>{c}</SelectItem>))}
             </SelectContent>
           </Select>
+          <Select value={kind} onValueChange={setKind}>
+            <SelectTrigger className="h-9 w-[104px] shrink-0 justify-start overflow-hidden rounded-xl border-0 bg-muted/50 pl-2 pr-2 text-xs shadow-sm [&>svg:last-child]:hidden gap-1.5 [&>span]:truncate sm:w-[128px]">
+              <Layers className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <SelectValue placeholder="Turi" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Barcha tur</SelectItem>
+              <SelectItem value="kirim">Kirim</SelectItem>
+              {EXPENSE_KINDS.map((k) => (<SelectItem key={k} value={(EXPENSE_KIND_LABELS as Record<string, string>)[k]}>{EXPENSE_KIND_LABELS[k]}</SelectItem>))}
+            </SelectContent>
+          </Select>
           <Select value={month} onValueChange={setMonth}>
-            <SelectTrigger className="h-9 w-[112px] shrink-0 justify-start rounded-xl border-0 bg-muted/50 pl-2 pr-2 text-xs shadow-sm [&>svg:last-child]:hidden gap-1.5">
+            <SelectTrigger className="h-9 w-[88px] shrink-0 justify-start overflow-hidden rounded-xl border-0 bg-muted/50 pl-2 pr-2 text-xs shadow-sm [&>svg:last-child]:hidden gap-1.5 [&>span]:truncate sm:w-[112px]">
+
               <CalendarDays className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <SelectValue placeholder="Oy" />
             </SelectTrigger>
@@ -592,10 +709,11 @@ function MasterJadvalPage() {
                 return (
                   <RevealRow key={r.id} onClick={() => setOpenRow(r)}>
                     <TableCell className="whitespace-nowrap py-2 text-[11px] text-muted-foreground align-top border-0">{fmtUz(r.date)}</TableCell>
-                    <TableCell className="py-2 align-top border-0">
-                      <div className="text-[12px] font-medium leading-tight truncate max-w-[180px]" title={r.name}>{r.name}</div>
-                      {sub && <div className="mt-0.5 text-[10px] text-muted-foreground leading-tight truncate max-w-[180px]">{sub}</div>}
+                    <TableCell className="min-w-0 max-w-0 py-2 align-top border-0">
+                      <div className="truncate text-[12px] font-medium leading-tight" title={r.name}>{r.name}</div>
+                      {sub && <div className="mt-0.5 truncate text-[10px] text-muted-foreground leading-tight">{sub}</div>}
                     </TableCell>
+
                     {showAmount && (
                       <TableCell className={`py-2 text-right text-[12px] font-semibold tabular-nums align-top border-0 ${r.in_amount ? "text-success" : ""}`}>
                         {fmtUZSc(r.total)}
@@ -625,7 +743,16 @@ function MasterJadvalPage() {
 
 
 
-      <RowDetailDialog row={openRow} onClose={() => setOpenRow(null)} showAmount={showAmount} />
+      <RowDetailDialog
+        row={openRow}
+        onClose={() => setOpenRow(null)}
+        showAmount={showAmount}
+        canEdit={canEdit}
+        onChanged={() => {
+          setOpenRow(null);
+          invalidateAll(qc);
+        }}
+      />
     </div>
   );
 }
@@ -657,7 +784,100 @@ function SortHead({
   );
 }
 
-function RowDetailDialog({ row, onClose, showAmount = true }: { row: Row | null; onClose: () => void; showAmount?: boolean }) {
+function RowDetailDialog({ row, onClose, showAmount = true, canEdit = false, onChanged }: { row: Row | null; onClose: () => void; showAmount?: boolean; canEdit?: boolean; onChanged?: () => void }) {
+  const [deleting, setDeleting] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editCategory, setEditCategory] = useState<string>("");
+  const [editKind, setEditKind] = useState<ExpenseKind>("operatsion");
+  const [editDesc, setEditDesc] = useState<string>("");
+  const [editQty, setEditQty] = useState<string>("");
+  const [editAmount, setEditAmount] = useState<string>("");
+
+  const { data: rawCategories = [] } = useQuery({
+    queryKey: ["expense_categories_list_names"],
+    queryFn: async () => {
+      const { data } = await supabase.from("expense_categories").select("name").order("name");
+      return (data ?? []).map((r: any) => r.name as string);
+    },
+    staleTime: 60_000,
+  });
+  const categories = useMemo(
+    () => rawCategories.filter((c) => String(c).trim().length > 0),
+    [rawCategories],
+  );
+
+  const tableFor = (id: string): string | null => {
+    const p = id.split(":")[0];
+    return ({ mat: "material_receipts", work: "work_progress", exp: "expenses", bp: "brigade_payments", inc: "incomes" } as Record<string, string>)[p] ?? null;
+  };
+
+  useEffect(() => {
+    if (!row) { setEditing(false); return; }
+    setEditCategory(row.category ?? "");
+    setEditKind((row.raw?.kind as ExpenseKind) || kindForCategory(row.category));
+    setEditDesc(row.name ?? "");
+    setEditQty(row.qty != null ? String(row.qty) : "");
+    setEditAmount(String(row.total ?? 0));
+  }, [row?.id]);
+
+  const isExpense = row?.id.startsWith("exp:");
+  const isIncome = row?.id.startsWith("inc:");
+  const incomeCategories = ["Naqd", "Bank", "Shartnoma"];
+
+  async function handleDelete() {
+    if (!row) return;
+    const table = tableFor(row.id);
+    const rawId = row.id.split(":")[1];
+    if (!table || !rawId) { toast.error("O'chirib bo'lmadi"); return; }
+    if (!window.confirm("Ushbu yozuv o'chirilsinmi?")) return;
+    setDeleting(true);
+    const { error } = await supabase.from(table as any).delete().eq("id", rawId);
+    setDeleting(false);
+    if (error) { toast.error("Xatolik: " + error.message); return; }
+    toast.success("O'chirildi");
+    onChanged?.();
+  }
+
+  async function handleSave() {
+    if (!row) return;
+    const table = tableFor(row.id);
+    const rawId = row.id.split(":")[1];
+    if (!table || !rawId) { toast.error("Saqlab bo'lmadi"); return; }
+    const patch: Record<string, any> = {};
+    const qty = editQty ? Number(editQty) : null;
+    const amt = editAmount ? Number(editAmount) : null;
+    if (table === "expenses") {
+      patch.category = editCategory || row.category;
+      patch.kind = editKind || kindForCategory(patch.category);
+      patch.description = editDesc;
+      if (qty != null && !Number.isNaN(qty)) patch.qty = qty;
+      if (amt != null && !Number.isNaN(amt)) patch.amount = amt;
+    } else if (table === "material_receipts") {
+      patch.material_name = editDesc;
+      if (qty != null && !Number.isNaN(qty)) patch.qty = qty;
+      if (amt != null && !Number.isNaN(amt)) patch.total_price = amt;
+    } else if (table === "work_progress") {
+      patch.work_type = editDesc;
+      if (qty != null && !Number.isNaN(qty)) patch.qty_done = qty;
+      if (amt != null && !Number.isNaN(amt)) patch.total_value = amt;
+    } else if (table === "brigade_payments") {
+      patch.note = editDesc;
+      if (amt != null && !Number.isNaN(amt)) patch.amount = amt;
+    } else if (table === "incomes") {
+      patch.description = editDesc;
+      if (editCategory) patch.category = editCategory;
+      if (amt != null && !Number.isNaN(amt)) patch.amount = amt;
+    }
+    setSaving(true);
+    const { error } = await supabase.from(table as any).update(patch).eq("id", rawId);
+    setSaving(false);
+    if (error) { toast.error("Xatolik: " + error.message); return; }
+    toast.success("Saqlandi");
+    setEditing(false);
+    onChanged?.();
+  }
+
   return (
     <Dialog open={!!row} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-2xl max-h-[85vh] overflow-auto">
@@ -668,22 +888,96 @@ function RowDetailDialog({ row, onClose, showAmount = true }: { row: Row | null;
         </DialogHeader>
         {row && (
           <div className="space-y-4 text-sm">
-            <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-              <Field label="Sana" value={fmtUzDateTime(row.date, row.raw?.created_at)} />
-              <Field label="Kategoriya" value={row.category} />
-              <Field label="Turi" value={row.kind} />
-              <Field label="Loyiha" value={row.project ?? "Tanlanmagan"} />
-              <Field label="Kim" value={row.who ?? "—"} />
-              <Field label="Manba" value={row.source_label} />
-              <Field label="Birim" value={row.unit ?? "—"} />
-              <Field label="Miqdor" value={row.qty != null ? String(row.qty) : "—"} />
-              {showAmount && <Field label="Narxi" value={row.unit_price ? fmtUZS(row.unit_price) : "—"} />}
-              {showAmount && <Field label="Jami narx" value={fmtUZS(row.total)} />}
-            </div>
-            {row.note && row.source === "web" && (
+            {editing ? (
+              <div className="space-y-3">
+                {(isExpense || isIncome) && (
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Kategoriya</div>
+                    <Select value={editCategory} onValueChange={setEditCategory}>
+                      <SelectTrigger><SelectValue placeholder="Kategoriya tanlang" /></SelectTrigger>
+                      <SelectContent>
+                        {(isIncome ? incomeCategories : categoriesForKind(editKind, categories)).map((c) => (
+                          <SelectItem key={c} value={c}>{c}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+                {isExpense && (
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Tur</div>
+                    <Select value={editKind} onValueChange={(v) => {
+                      const k = v as ExpenseKind;
+                      setEditKind(k);
+                      setEditCategory((cur) => categoriesForKind(k, categories).includes(cur) ? cur : (categoriesForKind(k, categories)[0] ?? cur));
+                    }}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {EXPENSE_KINDS.map((k) => <SelectItem key={k} value={k}>{EXPENSE_KIND_LABELS[k]}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+                <div>
+                  <div className="text-xs text-muted-foreground mb-1">Tavsif / Nomi</div>
+                  <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Miqdor</div>
+                    <Input type="number" step="0.01" value={editQty} onChange={(e) => setEditQty(e.target.value)} />
+                  </div>
+                  {showAmount && (
+                    <div>
+                      <div className="text-xs text-muted-foreground mb-1">Jami summa</div>
+                      <Input type="number" step="1" value={editAmount} onChange={(e) => setEditAmount(e.target.value)} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                <Field label="Sana" value={fmtUzDateTime(row.date, row.raw?.created_at)} />
+                <Field label="Kategoriya" value={row.category} />
+                <Field label="Turi" value={row.kind} />
+                <Field label="Loyiha" value={row.project ?? "Tanlanmagan"} />
+                <Field label="Kim" value={row.who ?? "—"} />
+                <Field label="Manba" value={row.source_label} />
+                <Field label="Birim" value={row.unit ?? "—"} />
+                <Field label="Miqdor" value={row.qty != null ? String(row.qty) : "—"} />
+                {showAmount && <Field label="Narxi" value={row.unit_price ? fmtUZS(row.unit_price) : "—"} />}
+                {showAmount && <Field label="Jami narx" value={fmtUZS(row.total)} />}
+              </div>
+            )}
+            {row.note && row.source === "web" && !editing && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Izoh</div>
                 <div className="rounded-md border border-border bg-muted/30 p-2">{row.note}</div>
+              </div>
+            )}
+            {canEdit && (
+              <div className="flex justify-end gap-2 pt-2 border-t border-border">
+                {editing ? (
+                  <>
+                    <Button variant="outline" size="sm" onClick={() => setEditing(false)} disabled={saving}>
+                      <X className="h-4 w-4 mr-1" /> Bekor
+                    </Button>
+                    <Button size="sm" onClick={handleSave} disabled={saving}>
+                      <Save className="h-4 w-4 mr-1" />
+                      {saving ? "Saqlanmoqda..." : "Saqlash"}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+                      <Pencil className="h-4 w-4 mr-1" /> Tahrirlash
+                    </Button>
+                    <Button variant="destructive" size="sm" onClick={handleDelete} disabled={deleting}>
+                      <Trash2 className="h-4 w-4 mr-1" />
+                      {deleting ? "O'chirilmoqda..." : "O'chirish"}
+                    </Button>
+                  </>
+                )}
               </div>
             )}
           </div>

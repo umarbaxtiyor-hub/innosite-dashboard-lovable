@@ -1,18 +1,17 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { requireAuthFromRequest } from "@/lib/require-auth.server";
 
-// Aisha TTS — o'zbek tilida tabiiy ovoz (Gulnoza modeli)
-// Docs: https://aisha.group/en/api-documentation/text-to-speech
-// Voice param "male"/"female" -> mood mapping (Aisha hozircha faqat Gulnoza ayol ovozi)
+// UzbekVoice.ai TTS — o'zbek tilida tabiiy ovoz
 export const Route = createFileRoute("/api/tts")({
   server: {
     handlers: {
       POST: async ({ request }) => {
         try {
-          const { text, voice, mood, speed } = (await request.json()) as {
+          await requireAuthFromRequest(request);
+          const { text, voice, model } = (await request.json()) as {
             text?: string;
             voice?: "male" | "female";
-            mood?: "Neutral" | "Cheerful" | "Happy" | "Sad";
-            speed?: number;
+            model?: string;
           };
 
           if (!text || typeof text !== "string") {
@@ -21,10 +20,9 @@ export const Route = createFileRoute("/api/tts")({
 
           const apiKey = process.env.AISHA_API_KEY;
           if (!apiKey) {
-            return json({ error: "AISHA_API_KEY sozlanmagan" }, 500);
+            return json({ error: "Ovoz xizmati kaliti sozlanmagan" }, 500);
           }
 
-          // Markdown belgilarini tozalash + Aisha 1000 belgilik limiti
           const clean = text
             .replace(/```[\s\S]*?```/g, " ")
             .replace(/[*_#>`|]/g, " ")
@@ -33,67 +31,37 @@ export const Route = createFileRoute("/api/tts")({
             .trim()
             .slice(0, 1000);
 
-          const form = new FormData();
-          form.append("transcript", clean);
-          form.append("language", "uz");
-          form.append("model", "Gulnoza");
-          form.append("mood", mood ?? "Neutral");
-          const sp = typeof speed === "number" && speed >= 0.5 && speed <= 2 ? speed : 1.0;
-          form.append("speed", String(sp));
+          void voice;
 
-          const res = await fetch("https://back.aisha.group/api/v1/tts/post/", {
+          const res = await fetch("https://uzbekvoice.ai/api/v1/tts", {
             method: "POST",
-            headers: { "X-Api-Key": apiKey, "Accept-Language": "uz" },
-            body: form,
+            headers: { Authorization: apiKey, "Content-Type": "application/json" },
+            body: JSON.stringify({ text: clean, model: model || "sevinch" }),
           });
 
-          const ctype = res.headers.get("content-type") ?? "";
           if (!res.ok) {
             const errText = await res.text();
-            return json(
-              { error: aishaErrorMessage(res.status, errText) },
-              res.status === 402 ? 402 : 502,
-            );
+            return json({ error: voiceErrorMessage(res.status, errText) }, 502);
           }
 
-          // Aisha JSON qaytaradi: { audio_path: "/media/tts_audios/xxx.wav" }
-          if (!ctype.includes("application/json")) {
-            // Ehtimol to'g'ridan-to'g'ri audio
-            const buf = await res.arrayBuffer();
-            return new Response(buf, {
-              status: 200,
-              headers: { "Content-Type": ctype || "audio/wav", "Cache-Control": "no-store" },
-            });
+          const j = (await res.json()) as { result?: { url?: string } };
+          const audioUrl = j.result?.url;
+          if (!audioUrl) {
+            return json({ error: "Ovoz fayli qaytmadi" }, 502);
           }
 
-          const j = (await res.json()) as { audio_path?: string };
-          if (!j.audio_path) {
-            return json({ error: "Aisha javobida audio_path yo'q" }, 502);
-          }
-
-          const audioUrl = j.audio_path.startsWith("http")
-            ? j.audio_path
-            : `https://back.aisha.group${j.audio_path}`;
-
-          const audioRes = await fetch(audioUrl, {
-            headers: { "X-Api-Key": apiKey },
-          });
+          const audioRes = await fetch(audioUrl);
           if (!audioRes.ok) {
             return json({ error: `Audio yuklanmadi [${audioRes.status}]` }, 502);
           }
 
           const buf = await audioRes.arrayBuffer();
-          const isWav = audioUrl.toLowerCase().endsWith(".wav");
-          // voice param mavjudligi backward-compat uchun saqlanadi (Aisha bitta ayol ovoz)
-          void voice;
           return new Response(buf, {
             status: 200,
-            headers: {
-              "Content-Type": isWav ? "audio/wav" : "audio/mpeg",
-              "Cache-Control": "no-store",
-            },
+            headers: { "Content-Type": "audio/wav", "Cache-Control": "no-store" },
           });
         } catch (e: unknown) {
+          if (e instanceof Response) return e;
           return json({ error: e instanceof Error ? e.message : "TTS xato" }, 500);
         }
       },
@@ -108,10 +76,10 @@ function json(body: unknown, status: number) {
   });
 }
 
-function aishaErrorMessage(status: number, body: string) {
-  if (status === 401) return "Aisha API kalit noto'g'ri yoki muddati o'tgan.";
-  if (status === 402) return "Aisha balansi yetarli emas. space.aisha.group da to'ldiring.";
+function voiceErrorMessage(status: number, body: string) {
+  if (status === 401 || status === 403) return "Ovoz xizmati kaliti noto'g'ri yoki muddati o'tgan.";
+  if (status === 402) return "Ovoz xizmati balansi yetarli emas.";
   if (status === 400) return `So'rov xato: ${body.slice(0, 200)}`;
-  if (status === 503) return "Aisha TTS xizmati vaqtincha mavjud emas.";
-  return `Aisha xato [${status}]: ${body.slice(0, 200)}`;
+  if (status === 503) return "Ovoz xizmati vaqtincha mavjud emas.";
+  return `Ovoz xizmati xatosi [${status}]: ${body.slice(0, 200)}`;
 }

@@ -20,7 +20,11 @@ export function usePermissionMatrix() {
       }
       return m;
     },
-    staleTime: 60_000,
+    staleTime: Infinity,
+    gcTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   });
   return { matrix: data ?? PAGE_PERMISSIONS, loading: isLoading };
 }

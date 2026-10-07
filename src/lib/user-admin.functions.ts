@@ -1,22 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { authAdmin, nameToEmail, getAdmin } from "@/lib/user-admin.server";
 
-async function authAdmin(token: string): Promise<string> {
-  if (!token) throw new Error("Avtorizatsiya kerak");
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !data?.user) throw new Error("Sessiya topilmadi");
-  const userId = data.user.id;
-  const { data: roleRow } = await supabaseAdmin
-    .from("user_roles").select("role")
-    .eq("user_id", userId).eq("role", "admin").maybeSingle();
-  if (!roleRow) throw new Error("Faqat adminlar uchun");
-  return userId;
-}
 
 export const listUsersWithRoles = createServerFn({ method: "POST" })
   .inputValidator((d: any) => z.object({ token: z.string() }).parse(d ?? {}))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     await authAdmin(data.token);
     const { data: profs } = await supabaseAdmin
       .from("profiles")
@@ -56,6 +46,7 @@ export const setUserRole = createServerFn({ method: "POST" })
     enabled: z.boolean(),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     const adminId = await authAdmin(data.token);
     if (!data.enabled && data.role === "admin" && data.user_id === adminId) {
       throw new Error("O'zingizdan admin rolini olib tashlay olmaysiz");
@@ -79,6 +70,7 @@ export const setUserTelegramId = createServerFn({ method: "POST" })
     telegram_user_id: z.number().int().nullable(),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     await authAdmin(data.token);
     const { error } = await supabaseAdmin.from("profiles")
       .update({ telegram_user_id: data.telegram_user_id })
@@ -87,10 +79,7 @@ export const setUserTelegramId = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
-function nameToEmail(name: string): string {
-  const slug = name.trim().toLowerCase().replace(/\s+/g, ".").replace(/[^a-z0-9._-]/g, "");
-  return `${slug}@tizim.local`;
-}
+
 
 export const createUserAccount = createServerFn({ method: "POST" })
   .inputValidator((d: unknown) => z.object({
@@ -100,6 +89,7 @@ export const createUserAccount = createServerFn({ method: "POST" })
     phone: z.string().optional(),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     await authAdmin(data.token);
     const email = nameToEmail(data.full_name);
     if (email.length < 8) throw new Error("Ism noto'g'ri (kamida 2 harf)");
@@ -127,13 +117,16 @@ export const deleteUserAccount = createServerFn({ method: "POST" })
     user_id: z.string().uuid(),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     const adminId = await authAdmin(data.token);
     if (data.user_id === adminId) throw new Error("O'zingizni o'chira olmaysiz");
     await supabaseAdmin.from("user_project_access").delete().eq("user_id", data.user_id);
     await supabaseAdmin.from("user_firm_access").delete().eq("user_id", data.user_id);
     await supabaseAdmin.from("user_roles").delete().eq("user_id", data.user_id);
     const { error } = await supabaseAdmin.auth.admin.deleteUser(data.user_id);
-    if (error) throw new Error(error.message);
+    // Auth foydalanuvchi topilmasa ham profil yozuvini tozalaymiz
+    if (error && !/not\s*found/i.test(error.message)) throw new Error(error.message);
+    await supabaseAdmin.from("profiles").delete().eq("id", data.user_id);
     return { ok: true };
   });
 
@@ -144,6 +137,7 @@ export const setUserActive = createServerFn({ method: "POST" })
     active: z.boolean(),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     const adminId = await authAdmin(data.token);
     if (!data.active && data.user_id === adminId) throw new Error("O'zingizni to'xtata olmaysiz");
     const { error } = await supabaseAdmin.from("profiles")
@@ -164,6 +158,7 @@ export const setUserProjects = createServerFn({ method: "POST" })
     project_ids: z.array(z.string().uuid()),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     await authAdmin(data.token);
     await supabaseAdmin.from("user_project_access").delete().eq("user_id", data.user_id);
     if (data.project_ids.length > 0) {
@@ -181,6 +176,7 @@ export const setUserFirms = createServerFn({ method: "POST" })
     firm_ids: z.array(z.string().uuid()),
   }).parse(d))
   .handler(async ({ data }) => {
+    const supabaseAdmin = await getAdmin();
     await authAdmin(data.token);
     await supabaseAdmin.from("user_firm_access").delete().eq("user_id", data.user_id);
     if (data.firm_ids.length > 0) {

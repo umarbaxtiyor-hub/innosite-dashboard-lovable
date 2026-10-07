@@ -3,6 +3,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
 import { handleUpdate } from "@/server/telegram.server";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
 type StepResult = {
   step: string;
@@ -84,7 +86,13 @@ async function waitFor<T>(fn: () => Promise<T | null>, ms = 2500): Promise<T | n
   return null;
 }
 
-export const runTelegramTest = createServerFn({ method: "POST" }).handler(async () => {
+export const runTelegramTest = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+  const { data: adminRole } = await supabaseAdmin
+    .from("user_roles").select("role")
+    .eq("user_id", context.userId).eq("role", "admin").maybeSingle();
+  if (!adminRole) throw new Error("Faqat adminlar uchun");
   const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
   if (!secret) {
     return { ok: false, error: "TELEGRAM_WEBHOOK_SECRET o'rnatilmagan", steps: [] as StepResult[] };

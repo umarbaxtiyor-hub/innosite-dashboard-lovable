@@ -4,11 +4,13 @@ import { PageHeader } from "@/components/PageHeader";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { MapPin, LogIn, Calendar, Download, AlertTriangle, CheckCircle2, BarChart3, Search, ChevronRight, ChevronLeft } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { useActiveProject } from "@/lib/project-context";
 
 const UZ_MONTHS = ["Yanvar","Fevral","Mart","Aprel","May","Iyun","Iyul","Avgust","Sentabr","Oktabr","Noyabr","Dekabr"];
 
@@ -77,6 +79,21 @@ type Att = {
   distance_m: number | null;
 };
 
+type AttendanceEmployee = {
+  id: string;
+  full_name: string;
+  position: string | null;
+};
+
+function tashkentDate() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tashkent",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 function fmtTime(iso: string) {
   return new Date(iso).toLocaleTimeString("uz-UZ", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tashkent" });
 }
@@ -122,12 +139,16 @@ function downloadFile(name: string, content: string, mime: string) {
 }
 
 export function DavomatPage() {
+  const { activeProjectId } = useActiveProject();
   const [rows, setRows] = useState<Att[]>([]);
+  const [employees, setEmployees] = useState<AttendanceEmployee[]>([]);
   const [search, setSearch] = useState("");
   const [workStart, setWorkStart] = useState("09:00");
   const [graceMin, setGraceMin] = useState(10);
   const [statsMonth, setStatsMonth] = useState<string>(new Date().toISOString().slice(0, 7));
+  const [attendanceDate, setAttendanceDate] = useState(tashkentDate);
   const [empDetail, setEmpDetail] = useState<string | null>(null);
+  const [savingEmployee, setSavingEmployee] = useState<string | null>(null);
 
   async function loadAtt() {
     const { data } = await supabase
@@ -144,7 +165,22 @@ export function DavomatPage() {
       else if (r.key === "lateness_grace_min" && r.value != null) setGraceMin(parseInt(String(r.value), 10) || 0);
     }
   }
-  useEffect(() => { loadAtt(); loadSettings(); }, []);
+  async function loadEmployees() {
+    let firmId: string | null = null;
+    if (activeProjectId) {
+      const { data: project } = await supabase.from("projects").select("firm_id").eq("id", activeProjectId).maybeSingle();
+      firmId = project?.firm_id ?? null;
+    }
+    let query = supabase.from("employees").select("id,full_name,position").eq("active", true).order("full_name");
+    if (firmId) query = query.eq("firm_id", firmId);
+    const { data, error } = await query;
+    if (error) {
+      toast.error("Xodimlar ro'yxatini yuklab bo'lmadi");
+      return;
+    }
+    setEmployees((data ?? []) as AttendanceEmployee[]);
+  }
+  useEffect(() => { loadAtt(); loadSettings(); loadEmployees(); }, [activeProjectId]);
 
   useEffect(() => {
     const ch = supabase
@@ -154,7 +190,7 @@ export function DavomatPage() {
     return () => { supabase.removeChannel(ch); };
   }, []);
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = tashkentDate();
   const todayCount = rows.filter((r) => r.attendance_date === today && r.kind === "check_in").length;
   const lateToday = rows.filter((r) => r.attendance_date === today && r.kind === "check_in" && lateness(r.created_at, workStart, graceMin) > 0).length;
 
@@ -210,6 +246,53 @@ export function DavomatPage() {
     return monthStats.filter((r) => r.employee.toLowerCase().includes(s));
   }, [monthStats, search]);
 
+  const attendanceRows = useMemo(() => {
+    const s = search.trim().toLowerCase();
+    return employees.filter((employee) =>
+      !s || employee.full_name.toLowerCase().includes(s) || (employee.position ?? "").toLowerCase().includes(s),
+    );
+  }, [employees, search]);
+
+  const checkedEmployeeIds = useMemo(() => new Set(
+    rows
+      .filter((row) => row.attendance_date === attendanceDate && row.kind === "check_in" && row.employee_id)
+      .map((row) => row.employee_id as string),
+  ), [rows, attendanceDate]);
+
+  async function setAttendance(employee: AttendanceEmployee, checked: boolean) {
+    if (!activeProjectId) {
+      toast.error("Avval loyihani tanlang");
+      return;
+    }
+    setSavingEmployee(employee.id);
+    try {
+      if (checked) {
+        const { error } = await supabase.from("employee_attendance").insert({
+          employee_id: employee.id,
+          employee_name: employee.full_name,
+          project_id: activeProjectId,
+          kind: "check_in",
+          attendance_date: attendanceDate,
+          note: "Ro'yxat orqali belgilandi",
+        });
+        if (error) throw error;
+      } else {
+        const ids = rows
+          .filter((row) => row.employee_id === employee.id && row.attendance_date === attendanceDate)
+          .map((row) => row.id);
+        if (ids.length) {
+          const { error } = await supabase.from("employee_attendance").delete().in("id", ids);
+          if (error) throw error;
+        }
+      }
+      await loadAtt();
+    } catch (error: any) {
+      toast.error(error?.message ?? "Davomatni saqlab bo'lmadi");
+    } finally {
+      setSavingEmployee(null);
+    }
+  }
+
   const empDetailDays = useMemo(() => {
     if (!empDetail) return [] as Array<{ date: string; in?: Att; out?: Att; lateMin: number | null; dur: string }>;
     const days = new Map<string, { in?: Att; out?: Att }>();
@@ -253,7 +336,7 @@ export function DavomatPage() {
     <div className="space-y-3 p-3 sm:p-4">
       <PageHeader
         title="Davomat"
-        subtitle="Telegram bot orqali kelish/ketish, kechikishlar."
+        subtitle="Xodimlarni ro'yxatdan belgilang."
       />
 
       {/* KPI - mobil uchun ixcham */}
@@ -288,6 +371,50 @@ export function DavomatPage() {
           <Download className="h-3.5 w-3.5" />
         </Button>
       </div>
+
+      <section className="overflow-hidden rounded-xl border bg-card">
+        <div className="flex items-center justify-between gap-3 border-b px-3 py-2.5">
+          <div>
+            <h3 className="text-sm font-semibold">Kunlik ro'yxat</h3>
+            <p className="text-[11px] text-muted-foreground">Kelgan xodimlarni belgilang</p>
+          </div>
+          <Input
+            type="date"
+            value={attendanceDate}
+            onChange={(event) => setAttendanceDate(event.target.value)}
+            className="h-9 w-[140px] shrink-0 text-xs"
+          />
+        </div>
+        {attendanceRows.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-muted-foreground">Faol xodim topilmadi</div>
+        ) : (
+          <ul className="divide-y">
+            {attendanceRows.map((employee) => {
+              const checked = checkedEmployeeIds.has(employee.id);
+              const saving = savingEmployee === employee.id;
+              return (
+                <li key={employee.id}>
+                  <label className="flex cursor-pointer items-center gap-3 px-3 py-3 hover:bg-muted/40">
+                    <Checkbox
+                      checked={checked}
+                      disabled={saving}
+                      onCheckedChange={(value) => setAttendance(employee, value === true)}
+                      aria-label={`${employee.full_name} davomat`}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium">{employee.full_name}</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">{employee.position ?? "Lavozim ko'rsatilmagan"}</span>
+                    </span>
+                    <Badge variant={checked ? "default" : "secondary"} className="text-[10px]">
+                      {saving ? "Saqlanmoqda" : checked ? "Keldi" : "Kelmagan"}
+                    </Badge>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
 
       {/* Oylik xodim kartochkalari */}
       <div className="space-y-2">

@@ -6,13 +6,14 @@ import { toast } from "sonner";
 import { Link } from "@tanstack/react-router";
 import { supabase } from "@/integrations/supabase/client";
 import { fmtUZS, fmtUZSc } from "@/lib/queries";
+import { isMaterialMirrorExpense } from "@/lib/boq-category-map";
 import { cn } from "@/lib/utils";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
 import {
   ArrowDownCircle, ArrowUpCircle, Wallet,
-  Boxes, PlusCircle, Users, HardHat, Hammer,
+  Boxes, PlusCircle, Users, HardHat, Hammer, UtensilsCrossed, Truck,
 } from "lucide-react";
 import { ProjectHeroCard } from "./ProjectHeroCard";
 import { HeroProjectPicker } from "@/components/HeroProjectPicker";
@@ -26,76 +27,24 @@ type Project = {
   pm_name?: string | null;
 };
 
-type Tint = "green" | "red" | "blue" | "violet" | "orange" | "teal" | "default";
+async function fetchAllRows<T>(buildQuery: (from: number, to: number) => any, pageSize = 1000): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += pageSize) {
+    const to = from + pageSize - 1;
+    const { data, error } = await buildQuery(from, to);
+    if (error) throw error;
+    const rows = (data ?? []) as T[];
+    all.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return all;
+}
 
-// Light/dark adaptiv — har bir tint uchun juda och pastel rang aralashtirilgan.
+// Light/dark adaptiv — har bir karta uchun juda och pastel rang aralashtirilgan.
 // Karta romkasi (var(--card-frame)) saqlanadi.
 const FRAME = "border-2 border-[var(--card-frame)]";
-const TINTS: Record<Tint, { card: string; icon: string; value: string }> = {
-  green:   { card: `${FRAME} kpi-tint-green`,  icon: "bg-[color-mix(in_oklab,#34d399_22%,var(--card))] text-foreground", value: "text-foreground" },
-  red:     { card: `${FRAME} kpi-tint-red`,    icon: "bg-[color-mix(in_oklab,#f87171_22%,var(--card))] text-foreground", value: "text-foreground" },
-  blue:    { card: `${FRAME} kpi-tint-blue`,   icon: "bg-[color-mix(in_oklab,#60a5fa_22%,var(--card))] text-foreground", value: "text-foreground" },
-  violet:  { card: `${FRAME} kpi-tint-violet`, icon: "bg-[color-mix(in_oklab,#a78bfa_22%,var(--card))] text-foreground", value: "text-foreground" },
-  orange:  { card: `${FRAME} kpi-tint-orange`, icon: "bg-[color-mix(in_oklab,#fb923c_22%,var(--card))] text-foreground", value: "text-foreground" },
-  teal:    { card: `${FRAME} kpi-tint-teal`,   icon: "bg-[color-mix(in_oklab,#2dd4bf_22%,var(--card))] text-foreground", value: "text-foreground" },
-  default: { card: `${FRAME} bg-card`,         icon: "bg-muted text-foreground", value: "text-foreground" },
-};
 
 
-
-function KpiCard({
-  label, value, hint, tint = "default", icon: Icon, onClick, to, search, full, large,
-}: {
-  label: string; value: string; hint?: string;
-  tint?: Tint; icon: any;
-  onClick?: () => void;
-  to?: string;
-  search?: Record<string, any>;
-  full?: boolean; large?: boolean;
-}) {
-  const t = TINTS[tint];
-  const baseFull = cn("group relative flex w-full items-center gap-3 rounded-2xl border p-4 sm:p-5 text-center transition-all hover:shadow-md hover:-translate-y-0.5", t.card);
-  const baseGrid = cn("group relative block w-full rounded-2xl border p-3 sm:p-4 text-left transition-all hover:shadow-md hover:-translate-y-0.5", t.card);
-
-  const fullInner = (
-    <>
-      <div className={cn("flex h-12 w-12 shrink-0 items-center justify-center rounded-full", t.icon)}>
-        <Icon className="h-5 w-5" />
-      </div>
-      <div className="min-w-0 flex-1 text-center">
-        <div className="text-[12px] font-bold uppercase tracking-wider text-muted-foreground">{label}</div>
-        <div className={cn("mt-1 text-2xl sm:text-3xl font-extrabold tabular-nums leading-tight tracking-tight", t.value)}>{value}</div>
-        {hint && <div className="mt-0.5 truncate text-[10px] font-medium text-muted-foreground">{hint}</div>}
-      </div>
-      <div className="h-12 w-12 shrink-0" aria-hidden />
-    </>
-  );
-
-  const gridInner = (
-    <div className="flex flex-col items-center gap-1.5 text-center">
-      <div className={cn("flex shrink-0 items-center justify-center rounded-full h-9 w-9", t.icon)}>
-        <Icon className="h-4.5 w-4.5" />
-      </div>
-      <div className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-muted-foreground leading-tight">{label}</div>
-      <div className={cn("font-extrabold tabular-nums leading-tight tracking-tight break-words", t.value, large ? "text-xl sm:text-2xl" : "text-lg sm:text-xl")}>{value}</div>
-      {hint && <div className="truncate text-[10px] font-medium text-muted-foreground">{hint}</div>}
-    </div>
-  );
-
-
-  if (to) {
-    return (
-      <Link to={to as any} search={search as any} className={full ? baseFull : baseGrid}>
-        {full ? fullInner : gridInner}
-      </Link>
-    );
-  }
-  return (
-    <button type="button" onClick={onClick} className={full ? baseFull : baseGrid}>
-      {full ? fullInner : gridInner}
-    </button>
-  );
-}
 
 type DialogKey =
   | "kirim" | "chiqim" | "kassa" | "offplan" | "salary"
@@ -121,11 +70,11 @@ export function ProjectKpiGrid({
   const { data, isFetching } = useQuery({
     queryKey: ["project-kpis-v3", projectId ?? "x", firmId ?? "x", allMode ? "all" : "scoped"],
     enabled,
-    staleTime: 0,
+    staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
-    refetchInterval: 15_000,
-    refetchOnMount: "always",
-    refetchOnWindowFocus: true,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     queryFn: async () => {
       // Loyihalar ro'yxatini aniqlash
       let projects: Project[] = [];
@@ -142,21 +91,23 @@ export function ProjectKpiGrid({
       const ids = projects.map((p) => p.id);
       const firmIds = Array.from(new Set(projects.map((p) => p.firm_id).filter(Boolean))) as string[];
       if (ids.length === 0) {
-        return { projects, project: null, materials: [], works: [], expenses: [], payments: [], boq: [], zMasters: [], incomes: [], offPlan: [], employees: [] };
+        return { projects, project: null, materials: [], works: [], expenses: [], payments: [], boq: [], zMasters: [], incomes: [], offPlan: [], employees: [], attendance: [] };
       }
 
-      const [mats, works, exps, pays, boqs, incs, offp, emps, zmasters] = await Promise.all([
-        supabase.from("material_receipts").select("id,material_name,qty,unit,unit_price,total_price,supplier_name,received_at,boq_code").in("project_id", ids).order("received_at", { ascending: false }).limit(500),
-        supabase.from("work_progress").select("id,work_type,qty_done,unit,unit_price,total_value,brigade_name,work_date,boq_code").in("project_id", ids).order("work_date", { ascending: false }).limit(500),
-        supabase.from("expenses").select("id,category,description,amount,expense_date,paid_by,payment_method").in("project_id", ids).order("expense_date", { ascending: false }).limit(500),
-        supabase.from("brigade_payments").select("id,brigade_name,kind,amount,payment_date,note").in("project_id", ids).order("payment_date", { ascending: false }).limit(500),
-        supabase.from("boq_items").select("id,code,description,category,qty,unit,planned_cost,actual_cost").in("project_id", ids),
-        supabase.from("incomes").select("id,amount,category,payment_method,income_date,description,payer,source").in("project_id", ids).order("income_date", { ascending: false }).limit(500),
-        supabase.from("project_zayavka").select("id,name,total,paid_amount,qty,qty_received,unit_price,status,off_plan").in("project_id", ids).eq("off_plan", true),
+      const attFrom = new Date(Date.now() - 29 * 86_400_000).toISOString().slice(0, 10);
+      const [mats, works, exps, pays, boqs, incs, offp, emps, zmasters, att] = await Promise.all([
+        fetchAllRows<any>((from, to) => supabase.from("material_receipts").select("id,material_name,qty,unit,unit_price,total_price,supplier_name,received_at,boq_code,zayavka_id,master_material_id").in("project_id", ids).order("received_at", { ascending: false }).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("work_progress").select("id,work_type,qty_done,unit,unit_price,total_value,brigade_name,work_date,boq_code,zayavka_id,master_work_id").in("project_id", ids).order("work_date", { ascending: false }).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("expenses").select("id,category,description,amount,expense_date,paid_by,payment_method,source,kind").in("project_id", ids).order("expense_date", { ascending: false }).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("brigade_payments").select("id,brigade_name,kind,amount,payment_date,note").in("project_id", ids).order("payment_date", { ascending: false }).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("boq_items").select("id,code,description,category,qty,unit,planned_cost,actual_cost").in("project_id", ids).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("incomes").select("id,amount,category,payment_method,income_date,description,payer,source").in("project_id", ids).order("income_date", { ascending: false }).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("project_zayavka").select("id,name,total,paid_amount,qty,qty_received,unit_price,status,off_plan").in("project_id", ids).eq("off_plan", true).range(from, to)),
         firmIds.length
-          ? supabase.from("employees").select("id,full_name,position,phone,monthly_salary,active,firm_id").in("firm_id", firmIds).eq("active", true)
-          : Promise.resolve({ data: [] as any[] }),
-        supabase.from("project_zayavka").select("id,name,kind,qty,qty_received,unit_price,total,off_plan").in("project_id", ids).is("zayavka_no", null).is("parent_id", null),
+          ? fetchAllRows<any>((from, to) => supabase.from("employees").select("id,full_name,position,phone,monthly_salary,active,firm_id").in("firm_id", firmIds).eq("active", true).range(from, to))
+          : Promise.resolve([] as any[]),
+        fetchAllRows<any>((from, to) => supabase.from("project_zayavka").select("id,name,kind,qty,qty_received,unit_price,total,off_plan,parent_id,master_material_id,master_work_id").in("project_id", ids).is("zayavka_no", null).range(from, to)),
+        fetchAllRows<any>((from, to) => supabase.from("employee_attendance").select("employee_id,employee_name,attendance_date,kind").in("project_id", ids).eq("kind", "check_in").gte("attendance_date", attFrom).range(from, to)),
       ]);
 
       // Aggregate "project" summary (min start, max end, sum budget)
@@ -175,15 +126,16 @@ export function ProjectKpiGrid({
       return {
         projects,
         project: aggProject,
-        materials: mats.data ?? [],
-        works: works.data ?? [],
-        expenses: exps.data ?? [],
-        payments: pays.data ?? [],
-        boq: boqs.data ?? [],
-        zMasters: zmasters.data ?? [],
-        incomes: incs.data ?? [],
-        offPlan: offp.data ?? [],
-        employees: emps.data ?? [],
+        materials: mats,
+        works,
+        expenses: exps,
+        payments: pays,
+        boq: boqs,
+        zMasters: zmasters,
+        incomes: incs,
+        offPlan: offp,
+        employees: emps,
+        attendance: att,
       };
     },
   });
@@ -191,9 +143,48 @@ export function ProjectKpiGrid({
   const k = useMemo(() => {
     const project = data?.project ?? null;
     const contract = Number(project?.total_budget ?? 0);
-    const matSum = (data?.materials ?? []).reduce((s: number, r: any) => s + (Number(r.total_price) || Number(r.qty) * Number(r.unit_price) || 0), 0);
-    const workSum = (data?.works ?? []).reduce((s: number, r: any) => s + (Number(r.total_value) || Number(r.qty_done) * Number(r.unit_price) || 0), 0);
-    const expSum = (data?.expenses ?? []).reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0);
+    const matAmt = (r: any) => Number(r.total_price) || Number(r.qty) * Number(r.unit_price) || 0;
+    const workAmt = (r: any) => Number(r.total_value) || Number(r.qty_done) * Number(r.unit_price) || 0;
+    // Smeta bilan bir xil mantiq: har bir qabul/ish qatorini smetadagi master
+    // zayavka qatoriga bog'laymiz. Master off_plan = true bo'lsa — Yordamchi,
+    // aks holda BOQ (Material / Ishlar) kartasiga tushadi.
+    const allZ = (data?.zMasters ?? []) as any[];
+    const zById: Record<string, any> = {};
+    allZ.forEach((z) => { zById[z.id] = z; });
+    const masterOf = (zid: string | null | undefined): any | null => {
+      let cur = zid ? zById[zid] : null;
+      let guard = 0;
+      while (cur?.parent_id && zById[cur.parent_id] && guard++ < 10) cur = zById[cur.parent_id];
+      return cur ?? null;
+    };
+    const zMastersAll = allZ.filter((z) => !z.parent_id);
+    const isOffPlanRow = (r: any, kind: "material" | "work") => {
+      let m = masterOf(r.zayavka_id);
+      if (!m) {
+        const mid = kind === "material" ? r.master_material_id : r.master_work_id;
+        if (mid) m = zMastersAll.find((x) => x.kind === kind && (kind === "material" ? x.master_material_id : x.master_work_id) === mid) ?? null;
+      }
+      // Smetada topilmasa — rejadan tashqari deb hisoblanadi
+      if (!m) return !String(r.boq_code ?? "").trim();
+      return m.off_plan === true;
+    };
+    const matSum = (data?.materials ?? []).reduce((s: number, r: any) => s + matAmt(r), 0);
+    const workSum = (data?.works ?? []).reduce((s: number, r: any) => s + workAmt(r), 0);
+    // Rejaga (BOQ) bog'lanmagan — Yordamchi kartasiga tushadi
+    const yordMatSum = (data?.materials ?? []).filter((r: any) => isOffPlanRow(r, "material")).reduce((s: number, r: any) => s + matAmt(r), 0);
+    const yordWorkSum = (data?.works ?? []).filter((r: any) => isOffPlanRow(r, "work")).reduce((s: number, r: any) => s + workAmt(r), 0);
+    // Jurnaldagi kind='operatsion' xarajatlari ham Operatsion kartasiga tushadi
+    const opsExpSum = (data?.expenses ?? [])
+      .filter((r: any) => String(r.kind ?? "") === "operatsion" && !isMaterialMirrorExpense(r))
+      .reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0);
+    const boqMatSum = matSum - yordMatSum;
+    const boqWorkSum = workSum - yordWorkSum;
+    // Faqat material_receipts ga takror yozilgan xarajatlar Chiqimdan chiqariladi.
+    // Ish (work_progress) yozuvlari pul chiqimi sifatida sanalmaydi, shuning uchun
+    // ularning jurnal qatori Chiqimda qoladi.
+    const cashExpenses = (data?.expenses ?? []).filter((r: any) => !isMaterialMirrorExpense(r));
+
+    const expSum = cashExpenses.reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0);
 
     // Kirimlarni 2 ga ajratamiz:
     //  • Shartnoma kirim — category 'shartnoma' bo'lsa (hero kartada ko'rinadi, kassaga bog'lanmaydi)
@@ -207,18 +198,31 @@ export function ProjectKpiGrid({
     const kassaIn = incomesArr.filter((r) => !isContract(r)).reduce((s, r) => s + Number(r.amount ?? 0), 0);
 
     const payIn = kassaIn; // KPI "Kirim" — kassa kirimi
-    const payOut = (data?.payments ?? []).filter((r: any) => r.kind === "avans").reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0);
-    const totalOut = matSum + workSum + expSum + payOut;
-    const balance = contract - totalOut;
+    // Usta/brigada to'lovlari — BARCHASI (avans + yakuniy + boshqa)
+    const payOut = (data?.payments ?? []).reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0);
+    // Moliyaviy hisob Jurnal bilan aynan bir xil:
+    // material qabuli + alohida xarajatlar + brigada to'lovlari.
+    // work_progress bajarilgan hajmni bildiradi, alohida pul chiqimi emas.
+    const totalOut = matSum + expSum + payOut;
+    const balance = kassaIn - totalOut;
+
+    // ===== Pul nazorati: har bir chiqim aynan 3 kartadan biriga tushadi =====
+    // Material + Ishlar + Operatsion = Chiqim (totalOut)
+    const kindOf = (e: any) => String(e.kind ?? "");
+    const sumBy = (fn: (e: any) => boolean) => cashExpenses.filter(fn).reduce((s: number, e: any) => s + Number(e.amount ?? 0), 0);
+    const spendMaterial = matSum + sumBy((e) => kindOf(e) === "boq_material");
+    const spendWork = payOut + sumBy((e) => kindOf(e) === "boq_work" || kindOf(e) === "ustalar");
+    const spendOperatsion = totalOut - spendMaterial - spendWork;
+
 
     // Payment-method breakdown of expenses (Naqd / Bank / Karta)
     const byMethod = { Naqd: 0, Bank: 0, Karta: 0 } as Record<string, number>;
-    (data?.expenses ?? []).forEach((e: any) => {
+    cashExpenses.forEach((e: any) => {
       const m = (e.payment_method as string) || "Naqd";
       byMethod[m] = (byMethod[m] ?? 0) + Number(e.amount ?? 0);
     });
     // Material / ish / usta to'lovlarida payment_method yo'q — default Naqd
-    byMethod.Naqd += matSum + workSum + payOut;
+    byMethod.Naqd += matSum + payOut;
 
     // Kassa kirim — payment_method bo'yicha (faqat shartnomadan tashqari)
     const inByMethod = { Naqd: 0, Bank: 0, Karta: 0 } as Record<string, number>;
@@ -238,11 +242,18 @@ export function ProjectKpiGrid({
     const boq = data?.boq ?? [];
     const works = data?.works ?? [];
     const matsArr = data?.materials ?? [];
+    // Normallashtirilgan nom: kichik harf + apostroflar birlashtiriladi +
+    // ortiqcha bo'shliqlar olib tashlanadi. work_type ↔ smeta nomi moslashi
+    // uchun ishlatiladi (masalan, "bo'yash" vs "bo'yash").
+    const normName = (s: string) =>
+      (s ?? "").toLowerCase().trim()
+        .replace(/[\u2018\u2019\u02bc`]/g, "'")
+        .replace(/\s+/g, " ");
     const doneByCode: Record<string, number> = {};
     const doneByDesc: Record<string, number> = {};
     works.forEach((w: any) => {
       const c = (w.boq_code || "").toString().trim();
-      const d = (w.work_type || "").toLowerCase().trim();
+      const d = normName(String(w.work_type ?? ""));
       if (c) doneByCode[c] = (doneByCode[c] ?? 0) + Number(w.qty_done ?? 0);
       if (d) doneByDesc[d] = (doneByDesc[d] ?? 0) + Number(w.qty_done ?? 0);
     });
@@ -253,32 +264,56 @@ export function ProjectKpiGrid({
     });
     const boqProgress = boq.map((b: any) => {
       const planned = Number(b.qty ?? 0);
-      const done = doneByCode[b.code] ?? doneByDesc[(b.description || "").toLowerCase().trim()] ?? 0;
+      const done = doneByCode[b.code] ?? doneByDesc[normName(b.description ?? "")] ?? 0;
       const pct = planned > 0 ? Math.min(100, Math.round((done / planned) * 100)) : 0;
       return { ...b, done, pct, matQty: matByCode[b.code] ?? 0 };
     });
-    // Fallback: project_zayavka masters (smeta uploaded as zayavka)
-    const zMasters = (data?.zMasters ?? []) as any[];
-    const zProgress = zMasters.map((m) => {
+    // Fallback: project_zayavka masters (smeta uploaded as zayavka).
+    // MUHIM: progress FAQAT ISH turlari (kind = 'work') bo'yicha hisoblanadi.
+    // Material (kind='material'), uskuna (kind='equipment') va qo'shimcha
+    // (kind='extra') qatorlari — ularning summasi va bajariishi — progressga
+    // umuman kiritilmaydi. Shuningdek kassa, xarajat, to'lov va material
+    // qabuli ham hisobga olinmaydi.
+    const zMasters = ((data?.zMasters ?? []) as any[]).filter((m) => !m.parent_id);
+    const zWorks = zMasters.filter(
+      (m) => String(m.kind ?? "").toLowerCase() === "work" && Number(m.qty ?? 0) > 0,
+    );
+    const zProgress = zWorks.map((m) => {
       const planned = Number(m.qty ?? 0);
-      const done = Number(m.qty_received ?? 0);
-      const pct = planned > 0 ? Math.min(100, Math.round((done / planned) * 100)) : 0;
-      return { pct, planned };
+      const nameKey = normName(String(m.name ?? ""));
+      // Bajarilgan hajm: zayavkada qayd etilgan qty_received yoki work_progress
+      // jadvalidagi mos ish hajmi — qaysi biri kattaroq bo'lsa.
+      const done = Math.max(Number(m.qty_received ?? 0), doneByDesc[nameKey] ?? 0);
+      const pct = planned > 0 ? Math.min(100, (done / planned) * 100) : 0;
+      const amount = Number(m.total) || planned * Number(m.unit_price ?? 0) || 0;
+      return { pct, planned, amount };
     }).filter((x) => x.planned > 0);
-    const combined = boqProgress.length ? boqProgress.map((b: any) => ({ pct: b.pct })) : zProgress;
-    const qtyProgress = combined.length
-      ? Math.round(combined.reduce((s, b) => s + b.pct, 0) / combined.length)
+
+    // Project Progress = Σ(Activity Progress % × Weight %)
+    //   Activity Progress % = bajarilgan hajm ÷ shartnoma hajmi × 100
+    //   Weight % = ish turi shartnoma summasi ÷ jami ish turlari shartnoma summasi
+    // Faqat BOQ ish turlari (WORK). Material, uskuna, kassa, xarajat, to'lov
+    // va xaridlar progress hisobiga kiritilmaydi.
+    const boqWorks = boqProgress.filter((b: any) => {
+      const c = String(b.category ?? "").toLowerCase();
+      return c.includes("ish") || c.includes("work");
+    });
+    const weighted = boqWorks.length
+      ? boqWorks.map((b: any) => ({
+          pct: Number(b.qty ?? 0) > 0 ? Math.min(100, (Number(b.done ?? 0) / Number(b.qty)) * 100) : 0,
+          amount: Number(b.planned_cost) || Number(b.qty ?? 0) * Number(b.rate ?? 0) || 0,
+        }))
+      : zProgress.map((z) => ({ pct: z.pct, amount: z.amount }));
+    const totalWeight = weighted.reduce((s, w) => s + w.amount, 0);
+    const progress = weighted.length
+      ? Math.round(
+          totalWeight > 0
+            ? weighted.reduce((s, w) => s + w.pct * (w.amount / totalWeight), 0)
+            : weighted.reduce((s, w) => s + w.pct, 0) / weighted.length,
+        )
       : 0;
-    const activeProgress = combined.filter((b) => b.pct > 0).length
-      ? Math.round(combined.filter((b) => b.pct > 0).reduce((s, b) => s + b.pct, 0) / combined.filter((b) => b.pct > 0).length)
-      : 0;
-    const smetaLimit = zMasters.reduce((s, m) => {
-      const total = Number(m.total) || Number(m.qty ?? 0) * Number(m.unit_price ?? 0) || 0;
-      return s + total;
-    }, 0);
-    const usedAgainstSmeta = matSum + workSum;
-    const valueProgress = smetaLimit > 0 ? Math.round((usedAgainstSmeta / smetaLimit) * 100) : 0;
-    const progress = Math.min(999, Math.max(qtyProgress, activeProgress, valueProgress));
+
+
 
     // Deadline + delay
     const today = new Date();
@@ -314,14 +349,78 @@ export function ProjectKpiGrid({
     // Kunbay (usta) xodimlar — oyligi yo'q bo'lganlar
     const dailyEmployees = employees.filter((e: any) => !Number(e.monthly_salary ?? 0));
     const dailyCount = dailyEmployees.length;
-    // Xodimlarga shu kungacha to'langan (expenses ichida oylik/ish haqi/avans kategoriyalari)
-    const salaryPaid = (data?.expenses ?? []).filter((e: any) => {
+    // Xodimlarga to'langan (oylik/ish haqi/avans/maosh kategoriyalari — expenses jadvalidan)
+    // Brigada to'lovlari alohida — Ustalar kartasida (payOut) ko'rinadi
+    const salaryExpSum = cashExpenses.filter((e: any) => {
       const c = String(e.category ?? "").toLowerCase();
-      return c.includes("oylik") || c.includes("ish haqi") || c.includes("avans") || c.includes("maosh");
+      return c.includes("oylik") || c.includes("ish haqi") || c.includes("maosh");
     }).reduce((s: number, e: any) => s + Number(e.amount ?? 0), 0);
+    const otherExpSum = expSum - salaryExpSum;
+    const salaryPaid = salaryExpSum;
+
+    // ===== Ovqat (kunlik) — oxirgi 30 kun bo'yicha o'rtacha =====
+    // Bozorlik bir kunda katta summaga qilinadi, lekin bir necha kun ishlatiladi.
+    // Shu sabab: 30 kunlik oziq-ovqat xarajati ÷ 30 kunlik jami odam-kun.
+    const foodFrom = new Date(Date.now() - 29 * 86_400_000).toISOString().slice(0, 10);
+    const isFoodCat = (c: string) => {
+      const s = c.toLowerCase();
+      return s.includes("oziq") || s.includes("ovqat") || s.includes("bozorlik");
+    };
+    const foodSum30 = cashExpenses
+      .filter((e: any) => isFoodCat(String(e.category ?? "")) && String(e.expense_date ?? "") >= foodFrom)
+      .reduce((s: number, e: any) => s + Number(e.amount ?? 0), 0);
+    const foodSumAll = cashExpenses
+      .filter((e: any) => isFoodCat(String(e.category ?? "")))
+      .reduce((s: number, e: any) => s + Number(e.amount ?? 0), 0);
+    // Texnika kategoriyasi bo'yicha jami
+    const texnikaSum = cashExpenses
+      .filter((e: any) => String(e.category ?? "").toLowerCase().includes("texnika"))
+      .reduce((s: number, e: any) => s + Number(e.amount ?? 0), 0);
+    const attRows = (data?.attendance ?? []) as any[];
+    const manDaySet = new Set<string>();
+    const dateSet = new Set<string>();
+    const todayStr = new Date().toISOString().slice(0, 10);
+    let todayPeople = 0;
+    attRows.forEach((r: any) => {
+      const d = String(r.attendance_date ?? "");
+      const who = String(r.employee_id ?? r.employee_name ?? "");
+      if (!d || !who) return;
+      manDaySet.add(`${d}|${who}`);
+      dateSet.add(d);
+      if (d === todayStr) todayPeople++;
+    });
+    // Bugun ishda bo'lganlar: davomatdan (xodim/usta ajratib)
+    const salaryIdSet = new Set(salaryEmployees.map((e: any) => String(e.id)));
+    const dailyIdSet = new Set(dailyEmployees.map((e: any) => String(e.id)));
+    const todayEmpSet = new Set<string>();
+    const todayUstaSet = new Set<string>();
+    attRows.forEach((r: any) => {
+      if (String(r.attendance_date ?? "") !== todayStr) return;
+      const id = r.employee_id ? String(r.employee_id) : "";
+      const who = id || String(r.employee_name ?? "");
+      if (!who) return;
+      if (id && dailyIdSet.has(id)) todayUstaSet.add(who);
+      else if (id && salaryIdSet.has(id)) todayEmpSet.add(who);
+      else todayEmpSet.add(who);
+    });
+    const todayBrigadeSet = new Set<string>(
+      works.filter((w: any) => String(w.work_date ?? "") === todayStr && w.brigade_name).map((w: any) => String(w.brigade_name)),
+    );
+    const todayEmpCount = todayEmpSet.size;
+    const todayUstaCount = todayUstaSet.size;
+    const todayBrigadeCount = todayBrigadeSet.size;
+
+    const manDays30 = manDaySet.size;
+    const foodPerManDay = manDays30 > 0 ? foodSum30 / manDays30 : 0;
+    const avgPeoplePerDay = dateSet.size > 0 ? manDays30 / dateSet.size : 0;
 
     return {
-      contract, matSum, workSum, expSum, payIn, contractIn, kassaIn, payOut, totalOut, balance,
+      todayEmpCount, todayUstaCount, todayBrigadeCount,
+      foodSum30, foodSumAll, manDays30, foodPerManDay, avgPeoplePerDay, todayPeople, texnikaSum,
+      contract, matSum, workSum, expSum, salaryExpSum, otherExpSum,
+      yordMatSum, yordWorkSum, boqMatSum, boqWorkSum, opsExpSum, yordTotal: yordMatSum + yordWorkSum + opsExpSum,
+      spendMaterial, spendWork, spendOperatsion,
+      payIn, contractIn, kassaIn, payOut, totalOut, balance,
       byMethod, inByKind, kassaNaqd, kassaBank, kassaTotal,
       progress, boqProgress, daysLeft, expectedPct, delay,
       offPlanSum, offPlanArr,
@@ -384,29 +483,93 @@ export function ProjectKpiGrid({
 
         {/* KPI kartalar — vertikal mobile tartibi */}
         <LockedOverlay locked={noProject}>
-          <KpiCard
-            label="Kassa"
-            value={fmtUZS(noProject ? 0 : k.kassaTotal)}
-            tint="blue"
-            icon={Wallet}
-            onClick={() => setOpen("kassa")}
-            full
-            large
-          />
-          <div className="mt-2 grid grid-cols-2 gap-2">
-            <KpiCard label="Kirim" value={fmtUZSc(noProject ? 0 : k.payIn)} tint="green" icon={ArrowDownCircle} onClick={() => setOpen("kirim")} large />
-            <KpiCard label="Chiqim" value={fmtUZSc(noProject ? 0 : k.totalOut)} tint="red" icon={ArrowUpCircle} onClick={() => setOpen("chiqim")} large />
-          </div>
-          <div className="mt-2 grid grid-cols-3 gap-2">
-            <KpiCard label="Material" value={fmtUZSc(noProject ? 0 : k.matSum)} tint="violet" icon={Boxes} to="/master-zayavka" search={{ tab: "material" }} />
-            <KpiCard label="Ishlar" value={fmtUZSc(noProject ? 0 : k.workSum)} tint="teal" icon={Hammer} to="/master-zayavka" search={{ tab: "work" }} />
-            <KpiCard label="Yordamchi" value={fmtUZSc(noProject ? 0 : k.offPlanSum)} tint="orange" icon={PlusCircle} to="/master-zayavka" search={{ tab: "variations" }} />
-          </div>
-          <div className="mt-2 grid grid-cols-2 gap-2">
-            <KpiCard label="Xodimlar" value={fmtUZSc(noProject ? 0 : k.salaryPaid)} tint="green" icon={Users} to="/brigade-balance" search={{ tab: "employees" }} />
-            <KpiCard label="Ustalar" value={fmtUZSc(noProject ? 0 : k.payOut)} tint="blue" icon={HardHat} to="/brigade-balance" search={{ tab: "brigades" }} />
-          </div>
+          {/* 2-karta: Kassa / Kirim / Chiqim */}
+          <section className={cn("rounded-2xl p-3 sm:p-4", FRAME, "kpi-tint-blue")}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">Moliya</span>
+              <Wallet className="h-4 w-4 text-muted-foreground" />
+            </div>
+            <button
+              type="button"
+              onClick={() => setOpen("kassa")}
+              className="mt-2 flex w-full items-baseline justify-between gap-2 rounded-xl px-1 py-1 text-left transition-colors hover:bg-foreground/5"
+            >
+              <span className="text-xs font-semibold text-muted-foreground">Kassa qoldiq</span>
+              <span className="text-2xl sm:text-3xl font-extrabold tabular-nums tracking-tight">
+                {fmtUZS(noProject ? 0 : k.kassaTotal)}
+              </span>
+            </button>
+            <div className="mt-2 grid grid-cols-2 divide-x divide-[var(--card-frame)] border-t-2 border-[var(--card-frame)] pt-2">
+              <button type="button" onClick={() => setOpen("kirim")} className="flex flex-col items-center gap-0.5 px-2 py-1 transition-colors hover:bg-foreground/5">
+                <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  <ArrowDownCircle className="h-3.5 w-3.5" /> Kirim
+                </span>
+                <span className="text-lg sm:text-xl font-extrabold tabular-nums text-success">{fmtUZSc(noProject ? 0 : k.payIn)}</span>
+              </button>
+              <button type="button" onClick={() => setOpen("chiqim")} className="flex flex-col items-center gap-0.5 px-2 py-1 transition-colors hover:bg-foreground/5">
+                <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  <ArrowUpCircle className="h-3.5 w-3.5" /> Chiqim
+                </span>
+                <span className="text-lg sm:text-xl font-extrabold tabular-nums text-destructive">{fmtUZSc(noProject ? 0 : k.totalOut)}</span>
+              </button>
+            </div>
+          </section>
+
+          {/* 3-karta: Smeta */}
+          <section className={cn("mt-2 rounded-2xl p-3 sm:p-4", FRAME, "kpi-tint-violet")}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">Smeta</span>
+              <Boxes className="h-4 w-4 text-muted-foreground" />
+            </div>
+            <div className="mt-2 grid grid-cols-3 divide-x divide-[var(--card-frame)] border-t-2 border-[var(--card-frame)] pt-2">
+              {[
+                { label: "Material", value: k.spendMaterial, icon: Boxes, to: "/master-zayavka", tab: "material" },
+                { label: "Ishlar", value: k.spendWork, icon: Hammer, to: "/master-zayavka", tab: "work" },
+                { label: "Operatsion", value: k.spendOperatsion, icon: PlusCircle, to: "/master-zayavka", tab: "variations" },
+              ].map((it) => (
+                <Link
+                  key={it.label}
+                  to={it.to as any}
+                  search={{ tab: it.tab } as any}
+                  className="flex flex-col items-center gap-0.5 px-1.5 py-1 text-center transition-colors hover:bg-foreground/5"
+                >
+                  <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    <it.icon className="h-3.5 w-3.5" /> {it.label}
+                  </span>
+                  <span className="text-base sm:text-lg font-extrabold tabular-nums">{fmtUZSc(noProject ? 0 : it.value)}</span>
+                </Link>
+              ))}
+            </div>
+          </section>
+
+          {/* 4-karta: Jamoa */}
+          <section className={cn("mt-2 rounded-2xl p-3 sm:p-4", FRAME, "kpi-tint-green")}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">Jamoa</span>
+              <Users className="h-4 w-4 text-muted-foreground" />
+            </div>
+            <div className="mt-2 grid grid-cols-3 divide-x divide-[var(--card-frame)] border-t-2 border-[var(--card-frame)] pt-2">
+              <Link to={"/brigade-balance" as any} search={{ tab: "employees" } as any} className="flex flex-col items-center gap-0.5 px-1.5 py-1 text-center transition-colors hover:bg-foreground/5">
+                <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground"><Users className="h-3.5 w-3.5" /> Xodimlar</span>
+                <span className="text-base sm:text-lg font-extrabold tabular-nums">{fmtUZSc(noProject ? 0 : k.salaryPaid)}</span>
+                <span className="text-[10px] text-muted-foreground">Bugun: {noProject ? 0 : k.todayEmpCount} nafar</span>
+              </Link>
+              <Link to={"/brigade-balance" as any} search={{ tab: "brigades" } as any} className="flex flex-col items-center gap-0.5 px-1.5 py-1 text-center transition-colors hover:bg-foreground/5">
+                <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground"><HardHat className="h-3.5 w-3.5" /> Ustalar</span>
+                <span className="text-base sm:text-lg font-extrabold tabular-nums">{fmtUZSc(noProject ? 0 : k.payOut)}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  Bugun: {noProject ? 0 : k.todayUstaCount} nafar{!noProject && k.todayBrigadeCount ? ` / ${k.todayBrigadeCount} brigada` : ""}
+                </span>
+              </Link>
+              <Link to={"/master-jadval" as any} search={{ category: "Texnika" } as any} className="flex flex-col items-center gap-0.5 px-1.5 py-1 text-center transition-colors hover:bg-foreground/5">
+                <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground"><Truck className="h-3.5 w-3.5" /> Texnika</span>
+                <span className="text-base sm:text-lg font-extrabold tabular-nums">{fmtUZSc(noProject ? 0 : k.texnikaSum)}</span>
+                <span className="text-[10px] text-muted-foreground">jami xarajat</span>
+              </Link>
+            </div>
+          </section>
         </LockedOverlay>
+
       </div>
 
 
@@ -481,12 +644,19 @@ function DetailContent({ which, data, k }: { which: DialogKey; data: any; k: any
       <>
         <DialogHeader><DialogTitle>Chiqim — {fmtUZS(k.totalOut)}</DialogTitle><DialogDescription>To'lov turi bo'yicha</DialogDescription></DialogHeader>
         <div className="grid grid-cols-2 gap-3 text-sm">
-          <div className="rounded-lg border p-3"><div className="text-xs text-muted-foreground">Naxd</div><div className="font-semibold">{fmtUZS(k.byMethod.Naqd)}</div></div>
-          <div className="rounded-lg border p-3"><div className="text-xs text-muted-foreground">Bank</div><div className="font-semibold">{fmtUZS(bank)}</div></div>
+          <div className="rounded-lg border p-4">
+            <div className="text-xs text-muted-foreground">Naxd</div>
+            <div className="mt-1 text-lg font-semibold">{fmtUZS(k.byMethod.Naqd)}</div>
+          </div>
+          <div className="rounded-lg border p-4">
+            <div className="text-xs text-muted-foreground">Bank</div>
+            <div className="mt-1 text-lg font-semibold">{fmtUZS(bank)}</div>
+          </div>
         </div>
       </>
     );
   }
+
 
   if (which === "kassa") {
     return (

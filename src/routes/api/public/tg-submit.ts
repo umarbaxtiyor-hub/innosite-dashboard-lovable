@@ -59,9 +59,29 @@ export const Route = createFileRoute("/api/public/tg-submit")({
         const token = process.env.TELEGRAM_BOT_TOKEN;
         if (!token) return new Response(JSON.stringify({ error: "no token" }), { status: 500, headers: { "Content-Type": "application/json", ...cors } });
         const v = verifyInitData(body.initData, token);
-        if (!v.ok) return new Response(JSON.stringify({ error: "invalid initData" }), { status: 401, headers: { "Content-Type": "application/json", ...cors } });
+        if (!v.ok || !v.userId) return new Response(JSON.stringify({ error: "invalid initData" }), { status: 401, headers: { "Content-Type": "application/json", ...cors } });
 
         const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
+
+        // Ensure the Telegram user is a registered profile and has access to this project.
+        const { data: prof } = await sb
+          .from("profiles")
+          .select("id, is_active")
+          .eq("telegram_user_id", v.userId)
+          .maybeSingle();
+        if (!prof?.id || prof.is_active === false) {
+          return new Response(JSON.stringify({ error: "not_registered" }), { status: 403, headers: { "Content-Type": "application/json", ...cors } });
+        }
+        const { data: roleRows } = await sb.from("user_roles").select("role").eq("user_id", prof.id);
+        const roles = (roleRows ?? []).map((r: any) => String(r.role));
+        const privileged = ["admin", "ceo", "direktor", "finans", "pm"];
+        if (!roles.some((r) => privileged.includes(r))) {
+          const { data: acc } = await sb
+            .from("user_project_access")
+            .select("project_id").eq("user_id", prof.id).eq("project_id", body.project_id).maybeSingle();
+          if (!acc) return new Response(JSON.stringify({ error: "no_project_access" }), { status: 403, headers: { "Content-Type": "application/json", ...cors } });
+        }
+
         const SRC = "telegram_webapp";
         const SRC_NOTE = `📱 WebApp shablon orqali (@${v.username ?? v.userId ?? "tg"})`;
 

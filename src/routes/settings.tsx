@@ -22,7 +22,6 @@ import { MasterJadvalTemplatePanel } from "@/components/MasterJadvalTemplate";
 import { useActiveProject } from "@/lib/project-context";
 import { YordamchiLimitSettings } from "@/components/settings/YordamchiLimitSettings";
 import { WorkScheduleSettings } from "@/components/settings/WorkScheduleSettings";
-import { RolePermissionsSettings } from "@/components/settings/RolePermissionsSettings";
 import { SecurityAuditPanel } from "@/components/settings/SecurityAuditPanel";
 import { ProjectsManagementPanel } from "@/components/settings/ProjectsManagementPanel";
 
@@ -63,8 +62,9 @@ function SettingsPage() {
 
         <TabsContent value="foydalanuvchilar" className="mt-4 space-y-4">
           <AdminListPanel />
-          <UserManagementPanel />
-          <RolePermissionsSettings />
+          <div className="rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground shadow-sm">
+            Foydalanuvchilarni boshqarish vaqtincha faqat Telegram bot orqali: <b>@Finance_tizim_bot</b> → <code>/admin</code> (tasdiqlash, lavozim, loyiha biriktirish, bloklash).
+          </div>
         </TabsContent>
 
         <TabsContent value="moliya" className="mt-4 space-y-4">
@@ -74,6 +74,9 @@ function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="xavfsizlik" className="mt-4 space-y-4">
+          <Link to="/sync-monitor" className="flex items-center justify-between rounded-xl border border-border bg-card p-4 text-sm font-medium shadow-sm hover:bg-muted/40">
+            <span>Google Sheets Sync Monitor</span><ChevronRight className="h-4 w-4" />
+          </Link>
           <SecurityAuditPanel />
           <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
             <div className="mb-2 flex items-center gap-2">

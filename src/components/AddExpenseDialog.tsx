@@ -15,7 +15,7 @@ import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, Command
 import { cn } from "@/lib/utils";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
-import { autoMatchBoqByText, boqCandidatesFor, categoryNeedsBoq, type BoqLite } from "@/lib/boq-category-map";
+import { autoMatchBoqByText, boqCandidatesFor, boqCandidatesForKind, categoryNeedsBoq, kindNeedsBoq, defaultCategoryForKind, categoriesForKind, kindForCategory, EXPENSE_KINDS, EXPENSE_KIND_LABELS, type BoqLite, type ExpenseKind } from "@/lib/boq-category-map";
 
 const PAY = ["Naqd", "Plastik", "O'tkazma", "Hisob", "Bank"];
 
@@ -101,13 +101,15 @@ type Row = {
   note: string;
   boq_code: string;
   boq_item_id: string | null;
+  kind: string;
 };
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
-const newRow = (cat = ""): Row => ({
+const newRow = (cat = "", kind: ExpenseKind = "boq_material"): Row => ({
   id: crypto.randomUUID(),
   date: todayStr(),
   category: cat,
+  kind,
   description: "",
   qty: "",
   unit: "",
@@ -131,6 +133,8 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
   const [fallbackBoqIds, setFallbackBoqIds] = useState<Set<string>>(new Set());
   const [rows, setRows] = useState<Row[]>(() => [newRow()]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [activeKind, setActiveKind] = useState<ExpenseKind>("boq_material");
+  const kindCategories = categoriesForKind(activeKind, categories);
   const qc = useQueryClient();
 
   useEffect(() => {
@@ -162,7 +166,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
           id: s.id,
           code: s.name?.slice(0, 24) || "—",
           description: s.name,
-          category: s.kind === "material" ? "material" : s.kind === "work" ? "ish" : null,
+          category: s.kind === "material" ? "material" : (s.kind === "work" || s.kind === "ustalar") ? "ish" : null,
         }));
         fallbackIds = new Set(boq.map((it) => it.id));
       }
@@ -170,15 +174,22 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
       setUnits(uns);
       setBoqItems(boq);
       setFallbackBoqIds(fallbackIds);
-      // ensure default category
-      setRows((rs) => rs.map((r) => r.category ? r : { ...r, category: cats[0] ?? "" }));
+      // ensure default kind + category
+      setRows((rs) => rs.map((r) => {
+        const k = (r.kind as ExpenseKind) || "boq_material";
+        const kc = categoriesForKind(k, cats);
+        return { ...r, kind: k, category: r.category || kc[0] || "" };
+      }));
     })();
   }, [open, projectId]);
 
-  // Qator uchun BOQ nomzodlari (kategoriya bo'yicha filtrlangan)
-  function candidatesFor(category: string): BoqLite[] {
-    return boqCandidatesFor(category, boqItems);
+  // Qator uchun BOQ nomzodlari — endi TUR bo'yicha filtrlanadi
+  function candidatesForRow(r: { kind: string; category: string }): BoqLite[] {
+    if (kindNeedsBoq(r.kind)) return boqCandidatesForKind(r.kind, boqItems);
+    return boqCandidatesFor(r.category, boqItems);
   }
+  const rowNeedsBoq = (r: { kind: string; category: string }) =>
+    kindNeedsBoq(r.kind) || categoryNeedsBoq(r.category);
 
   function update(id: string, patch: Partial<Row>) {
     setRows((rs) =>
@@ -195,11 +206,13 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
         const descChanged = patch.description != null && patch.description !== r.description;
         const userPickedBoq = patch.boq_code != null || patch.boq_item_id != null;
         if (!userPickedBoq && (catChanged || descChanged)) {
-          if (!categoryNeedsBoq(next.category)) {
+          if (!(kindNeedsBoq(next.kind) || categoryNeedsBoq(next.category))) {
             next.boq_code = "";
             next.boq_item_id = null;
           } else {
-            const cands = boqCandidatesFor(next.category, boqItems);
+            const cands = kindNeedsBoq(next.kind)
+              ? boqCandidatesForKind(next.kind, boqItems)
+              : boqCandidatesFor(next.category, boqItems);
             const hit = autoMatchBoqByText(next.description, cands);
             if (hit) {
               next.boq_code = hit.code;
@@ -216,7 +229,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
     );
   }
   function remove(id: string) { setRows((rs) => rs.filter((r) => r.id !== id)); }
-  function addBlank() { setRows((rs) => [...rs, newRow(rs[rs.length - 1]?.category ?? categories[0] ?? "")]); }
+  function addBlank() { setRows((rs) => [...rs, newRow(rs[rs.length - 1]?.category ?? kindCategories[0] ?? "", activeKind)]); }
 
 
   const m = useMutation({
@@ -225,6 +238,18 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
         .map((r) => ({ r, amt: Number(String(r.amount).replace(/[^\d.-]/g, "")) }))
         .filter(({ r, amt }) => amt > 0 && r.category);
       if (!valid.length) throw new Error("Kamida bitta to'liq qator kiriting (kategoriya va summa)");
+
+      // BOQ material/ish turlarida smeta bandi va hajm kerak — lekin faqat
+      // loyihada smeta bandlari mavjud bo'lsa. Ustalar avansida hajm bo'lmaydi.
+      const missing = valid.find(({ r }) =>
+        kindNeedsBoq(r.kind) && r.kind !== "ustalar"
+        && boqCandidatesForKind(r.kind, boqItems).length > 0
+        && (!r.boq_item_id || !(Number(r.qty) > 0)));
+      if (missing) {
+        throw new Error(
+          `"${EXPENSE_KIND_LABELS[(missing.r.kind as ExpenseKind)] ?? missing.r.kind}" turida smeta bandini tanlang va hajmini kiriting`,
+        );
+      }
       if (!projectId) {
         const ok = typeof window !== "undefined" && window.confirm(
           "Loyiha tanlanmagan. Xarajatni loyihasiz saqlashni tasdiqlaysizmi?",
@@ -258,7 +283,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
 
         const linked = expenseRows
           .map(({ r, amt }) => ({ r, amt, picked: pickBoq(r) }))
-          .filter(({ r, picked }) => picked && categoryNeedsBoq(r.category) && Number(r.qty) > 0);
+          .filter(({ r, picked }) => picked && (kindNeedsBoq(r.kind) || categoryNeedsBoq(r.category)) && Number(r.qty) > 0);
 
         const boqMap = new Map<string, { zayavkaId: string; kind: "material" | "work" }>();
         for (const it of boqItems) {
@@ -289,7 +314,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
         }
 
         const payload = expenseRows.map(({ r, amt }) => {
-          const needsBoq = categoryNeedsBoq(r.category);
+          const needsBoq = kindNeedsBoq(r.kind) || categoryNeedsBoq(r.category);
           const picked = needsBoq ? pickBoq(r) : null;
           const info = picked ? boqMap.get(picked.id) : null;
           const safeBoqItemId = picked && !fallbackBoqIds.has(picked.id)
@@ -305,8 +330,12 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
             amount: amt,
             payment_method: r.payment as any,
             expense_date: r.date,
-            source: "web",
+            // BOQ ga bog'langan yozuv material_receipts/work_progress ga ham tushadi.
+            // Material nusxasi Chiqimda takror sanalmasligi uchun alohida belgilanadi;
+            // ish nusxasi pul chiqimi emas, shuning uchun jurnal qatori Chiqimda qoladi.
+            source: info ? (info.kind === "work" ? "web_boq_work" : "web_boq_mat") : "web",
             source_note: r.note?.trim() || null,
+            kind: (r.kind as ExpenseKind) || kindForCategory(r.category),
             boq_code: needsBoq ? (r.boq_code?.trim() || picked?.code || null) : null,
             boq_item_id: safeBoqItemId,
             zayavka_id: info?.zayavkaId ?? null,
@@ -390,7 +419,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
       qc.invalidateQueries({ queryKey: ["master-jadval"] });
       qc.invalidateQueries({ queryKey: ["project-kpis-v3"] });
       setOpen(false);
-      setRows([newRow(categories[0] ?? "")]);
+      setRows([newRow(kindCategories[0] ?? "")]);
       setExpanded({});
     },
     onError: (e: any) => toast.error(e?.message ?? "Xato"),
@@ -419,6 +448,7 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
             <TableHeader className="bg-muted/40 sticky top-0">
               <TableRow>
                 <TableHead className="w-[110px]">Sana</TableHead>
+                <TableHead className="w-[120px]">Tur</TableHead>
                 <TableHead className="w-[140px]">Kategoriya</TableHead>
                 <TableHead className="w-[120px]">BOQ kodi</TableHead>
                 <TableHead className="min-w-[180px]">Nomi</TableHead>
@@ -436,25 +466,35 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
                 <TableRow key={r.id}>
                   <TableCell className="p-1"><Input className="h-8" type="date" value={r.date} onChange={(e) => update(r.id, { date: e.target.value })} /></TableCell>
                   <TableCell className="p-1">
-                    <Select value={r.category} onValueChange={(v) => update(r.id, { category: v })}>
-                      <SelectTrigger className="h-8"><SelectValue placeholder="Tanlang" /></SelectTrigger>
+                    <Select value={r.kind as ExpenseKind} onValueChange={(v) => {
+                      const k = v as ExpenseKind;
+                      setActiveKind(k);
+                      update(r.id, { kind: k, category: defaultCategoryForKind(k, categories), boq_code: "", boq_item_id: null });
+                    }}>
+                      <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        {categories.length === 0 ? (
-                          <div className="px-2 py-1.5 text-xs text-muted-foreground">Sozlamalardan qo'shing</div>
-                        ) : categories.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                        {EXPENSE_KINDS.map((k) => <SelectItem key={k} value={k}>{EXPENSE_KIND_LABELS[k]}</SelectItem>)}
                       </SelectContent>
                     </Select>
                   </TableCell>
                   <TableCell className="p-1">
-                    {categoryNeedsBoq(r.category) ? (
-                      candidatesFor(r.category).length === 0 ? (
+                    <Select value={r.category} onValueChange={(v) => update(r.id, { category: v })}>
+                      <SelectTrigger className="h-8"><SelectValue placeholder="Tanlang" /></SelectTrigger>
+                      <SelectContent>
+                        {categoriesForKind(r.kind as ExpenseKind, categories).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </TableCell>
+                  <TableCell className="p-1">
+                    {rowNeedsBoq(r) ? (
+                      candidatesForRow(r).length === 0 ? (
                         <span className="text-[11px] text-muted-foreground">Loyihada BOQ yo'q</span>
                       ) : (
                         <BoqCombobox
                           className="h-8"
                           value={r.boq_item_id}
-                          items={candidatesFor(r.category)}
-                          onPick={(b) => update(r.id, { boq_code: b.code, boq_item_id: b.id })}
+                          items={candidatesForRow(r)}
+                          onPick={(b) => update(r.id, { boq_code: b.code, boq_item_id: b.id, description: r.description || b.description || b.code })}
                           onClear={() => update(r.id, { boq_code: "", boq_item_id: null })}
                         />
                       )
@@ -511,23 +551,33 @@ export function AddExpenseDialog({ projectId, disabled }: { projectId: string | 
                     )}
                   </div>
                 </div>
-                <Select value={r.category} onValueChange={(v) => update(r.id, { category: v })}>
-                  <SelectTrigger className="h-9 text-sm"><SelectValue placeholder="Kategoriya" /></SelectTrigger>
-                  <SelectContent>
-                    {categories.length === 0 ? (
-                      <div className="px-2 py-1.5 text-xs text-muted-foreground">Sozlamalardan qo'shing</div>
-                    ) : categories.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-                {categoryNeedsBoq(r.category) && (
-                  candidatesFor(r.category).length === 0 ? (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <Select value={r.kind as ExpenseKind} onValueChange={(v) => {
+                    const k = v as ExpenseKind;
+                    setActiveKind(k);
+                    update(r.id, { kind: k, category: defaultCategoryForKind(k, categories), boq_code: "", boq_item_id: null });
+                  }}>
+                    <SelectTrigger className="h-9 text-sm"><SelectValue placeholder="Tur" /></SelectTrigger>
+                    <SelectContent>
+                      {EXPENSE_KINDS.map((k) => <SelectItem key={k} value={k}>{EXPENSE_KIND_LABELS[k]}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                  <Select value={r.category} onValueChange={(v) => update(r.id, { category: v })}>
+                    <SelectTrigger className="h-9 text-sm"><SelectValue placeholder="Kategoriya" /></SelectTrigger>
+                    <SelectContent>
+                      {categoriesForKind(r.kind as ExpenseKind, categories).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                {rowNeedsBoq(r) && (
+                  candidatesForRow(r).length === 0 ? (
                     <div className="text-[11px] text-muted-foreground px-1">Loyihada BOQ yo'q</div>
                   ) : (
                     <BoqCombobox
                       className="h-9 text-sm"
                       value={r.boq_item_id}
-                      items={candidatesFor(r.category)}
-                      onPick={(b) => update(r.id, { boq_code: b.code, boq_item_id: b.id })}
+                      items={candidatesForRow(r)}
+                      onPick={(b) => update(r.id, { boq_code: b.code, boq_item_id: b.id, description: r.description || b.description || b.code })}
                       onClear={() => update(r.id, { boq_code: "", boq_item_id: null })}
                       placeholder="BOQ kodi"
                     />

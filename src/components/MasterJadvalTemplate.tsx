@@ -21,13 +21,14 @@ function rowHash(parts: Array<string | number | null | undefined>): string {
 // Master jadval qaysi kategoriyalarni qo'llab-quvvatlasa, shu yerda ko'rsatilgan.
 // Shablonda foydalanuvchiga ko'rsatib, importda mos jadvalga yozamiz.
 export const KATEGORIYALAR = [
-  "Material (BOQ)",
-  "Ish (BOQ)",
-  "Qo'shimcha (BOQ)",
-  "Bozorlik",
-  "Transport",
-  "Yordamchi",
-  "Xodimlar",
+  "Qurilish materiali",
+  "Oziq-ovqat",
+  "Benzin",
+  "Salyarka",
+  "Texnika",
+  "Ofis/Lager",
+  "Oylik",
+  "Avans",
   "Boshqa",
 ] as const;
 
@@ -100,8 +101,8 @@ const SHEETS = [
     table: "expenses",
     headers: ["Sana (YYYY-MM-DD)", "BOQ kodi", "Kategoriya", "Tavsif", "Birlik", "Miqdor", "Birim narx", "Summa", "To'lovchi", "To'lov usuli", "Izoh"],
     sample: [
-      ["2026-05-09", "X-001", "Transport", "Yuk tashish", "kun", 1, 500000, 500000, "Akromjon", "Naqd", ""],
-      ["2026-05-09", "", "Transport", "Benzin AI-92", "litr", 50, 12000, 600000, "Direktor", "Plastik", ""],
+      ["2026-05-09", "X-001", "Texnika", "Yuk tashish", "kun", 1, 500000, 500000, "Akromjon", "Naqd", ""],
+      ["2026-05-09", "", "Benzin", "Benzin AI-92", "litr", 50, 12000, 600000, "Direktor", "Plastik", ""],
     ],
     map: (r: any, projectId: string) => {
       const date = r["Sana (YYYY-MM-DD)"] || new Date().toISOString().slice(0, 10);

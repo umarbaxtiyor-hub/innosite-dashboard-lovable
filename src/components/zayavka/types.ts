@@ -1,4 +1,4 @@
-export type Kind = "material" | "work" | "equipment";
+export type Kind = "material" | "work" | "equipment" | "ustalar";
 
 export type Z = {
   id: string; project_id: string; kind: Kind; name: string; unit: string;

@@ -5,25 +5,23 @@ import {
   BookOpen,
   ClipboardList,
   Calculator,
-  Settings,
+  FileText,
 } from "lucide-react";
 import { useCurrentRoles } from "@/hooks/use-current-roles";
 import { canAccessPath } from "@/lib/permissions";
 import { usePermissionMatrix } from "@/hooks/use-permission-matrix";
 import { useActiveProject } from "@/lib/project-context";
-import { AIFloatingButton } from "@/components/AIFloatingButton";
 import { cn } from "@/lib/utils";
 
 const items = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard },
   { title: "Smeta", url: "/master-zayavka", icon: BookOpen },
   { title: "Jurnal", url: "/master-jadval", icon: ClipboardList },
+  { title: "HR", url: "/brigade-balance", icon: Users },
   { title: "Buxgalter", url: "/buxalteriya", icon: Calculator },
-  { title: "Xodimlar", url: "/brigade-balance", icon: Users },
-  { title: "Sozlamalar", url: "/settings", icon: Settings },
 ] as const;
 
-const PROJECT_LESS = new Set(["/", "/settings"]);
+const PROJECT_LESS = new Set(["/"]);
 
 export function MobileTopNav() {
   const currentPath = useRouterState({ select: (s) => s.location.pathname });
@@ -57,7 +55,6 @@ export function MobileTopNav() {
           </Link>
         );
       })}
-      <AIFloatingButton variant="navItem" />
     </nav>
   );
 }

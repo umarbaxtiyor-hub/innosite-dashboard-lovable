@@ -5,7 +5,9 @@ import {
   BookOpen,
   ClipboardList,
   Calculator,
-  Settings,
+  FileText,
+  Gauge,
+  Sparkles,
 } from "lucide-react";
 import logoInnosite from "@/assets/logo-innosite.png";
 
@@ -31,7 +33,6 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 
-import { AIFloatingButton } from "@/components/AIFloatingButton";
 import { useCurrentRoles } from "@/hooks/use-current-roles";
 import { canAccessPath } from "@/lib/permissions";
 import { usePermissionMatrix } from "@/hooks/use-permission-matrix";
@@ -43,10 +44,12 @@ const items = [
   { title: "Jurnal", url: "/master-jadval", icon: ClipboardList },
 
 
+  { title: "HR", url: "/brigade-balance", icon: Users },
   { title: "Buxgalteriya", url: "/buxalteriya", icon: Calculator },
-  { title: "Xodimlar", url: "/brigade-balance", icon: Users },
-  { title: "Sozlamalar", url: "/settings", icon: Settings },
+  { title: "CEO Dashboard", url: "/ceo", icon: Gauge },
+  { title: "AI Control Center", url: "/ai-insights", icon: Sparkles },
 ] as const;
+const MGMT_ONLY: Record<string, string[]> = { "/ceo": ["admin", "finans", "ceo"], "/ai-insights": ["admin", "finans", "ceo"], "/sync-monitor": ["admin", "finans"] };
 
 export function AppSidebar() {
   const { state, isMobile, setOpenMobile } = useSidebar();
@@ -57,7 +60,7 @@ export function AppSidebar() {
   const { matrix, loading: matrixLoading } = usePermissionMatrix();
   const visibleItems = loading || matrixLoading
     ? items
-    : items.filter((it) => canAccessPath(it.url, roles, matrix));
+    : items.filter((it) => canAccessPath(it.url, roles, matrix) && (!MGMT_ONLY[it.url] || MGMT_ONLY[it.url].some((r) => roles.includes(r))));
 
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
@@ -106,9 +109,6 @@ export function AppSidebar() {
                   </SidebarMenuItem>
                 );
               })}
-              <SidebarMenuItem>
-                <AIFloatingButton variant="sidebar" collapsed={collapsed} />
-              </SidebarMenuItem>
             </SidebarMenu>
           </SidebarGroupContent>
 

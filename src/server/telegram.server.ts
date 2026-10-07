@@ -2,11 +2,14 @@
 // Foydalanuvchi kun davomida xarajat/material/zayavka yozadi (matn/ovoz/rasm) →
 // AI har birini avtomatik kategoriyaga ajratadi → DRAFT ga qo'shiladi →
 // Foydalanuvchi "✅ Tasdiqlash" tugmasini bosgach hammasi DB ga yoziladi.
-import { createClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { getSheetContext, detectDayReportRequest, buildSheetDayPdf, appendFuelEntries, buildFuelDayPdf, detectReportKind, getFuelContext, detectExcelRequest, buildSheetExcel, appendHrEntries, buildHrDayPdf, getHrContext, appendDprEntries, buildDprDayPdf, getDprContext } from "./sheets-sync.server";
 import {
   tryStartJoinRequest,
   tryHandleJoinFlow,
   tryHandleAdminCommand,
+  tryHandleAdminFlow,
   tryHandleCallback as tryHandleUserAdminCallback,
 } from "@/server/telegram-user-admin";
 
@@ -14,13 +17,7 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY!;
 
-function admin() {
-  return createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-}
+const admin = () => supabaseAdmin as unknown as SupabaseClient;
 
 // ---------- Telegram API ----------
 async function tg(method: string, body: any) {
@@ -38,70 +35,216 @@ const editText = (chat_id: number, message_id: number, text: string, reply_marku
 const answerCb = (id: string, text?: string) =>
   tg("answerCallbackQuery", { callback_query_id: id, text });
 
+// ---------- Uzbek TTS text normalizer (faqat ovoz uchun matnni tabiiylashtirish) ----------
+const UZ_ONES = ["", "bir", "ikki", "uch", "to'rt", "besh", "olti", "yetti", "sakkiz", "to'qqiz"];
+const UZ_TENS = ["", "o'n", "yigirma", "o'ttiz", "qirq", "ellik", "oltmish", "yetmish", "sakson", "to'qson"];
+
+function uzUnder1000(n: number): string {
+  const parts: string[] = [];
+  const h = Math.floor(n / 100);
+  const t = Math.floor((n % 100) / 10);
+  const o = n % 10;
+  if (h) parts.push(`${h > 1 ? UZ_ONES[h] + " " : ""}yuz`);
+  if (t) parts.push(UZ_TENS[t]);
+  if (o) parts.push(UZ_ONES[o]);
+  return parts.join(" ").trim();
+}
+
+function uzNumberToWords(num: number): string {
+  if (!isFinite(num)) return "";
+  if (num === 0) return "nol";
+  const neg = num < 0;
+  let n = Math.floor(Math.abs(num));
+  const frac = Math.round((Math.abs(num) - n) * 100);
+  const groups: { value: number; name: string }[] = [
+    { value: 1_000_000_000, name: "milliard" },
+    { value: 1_000_000, name: "million" },
+    { value: 1_000, name: "ming" },
+  ];
+  const out: string[] = [];
+  for (const g of groups) {
+    const q = Math.floor(n / g.value);
+    if (q > 0) {
+      out.push(`${q === 1 && g.name === "ming" ? "" : uzUnder1000(q) + " "}${g.name}`.trim());
+      n -= q * g.value;
+    }
+  }
+  if (n > 0) out.push(uzUnder1000(n));
+  let res = out.join(" ").replace(/\s+/g, " ").trim();
+  if (frac > 0) res += ` butun yuzdan ${uzUnder1000(frac)}`;
+  return (neg ? "minus " : "") + res;
+}
+
+function naturalizeUzbekForTts(input: string): string {
+  let s = input;
+
+  // Markdown / HTML / kod bloklarini olib tashlash
+  s = s
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/!?\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, " havola ")
+    .replace(/^\s{0,3}#{1,6}\s*/gm, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/[*_#>|~^]/g, " ");
+
+  // Emoji va maxsus belgilar
+  s = s.replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{FE0F}\u{2B00}-\u{2BFF}]/gu, " ");
+
+  // Ro'yxat belgilari -> tabiiy pauza
+  s = s.replace(/^\s*[-•▪●]\s*/gm, "").replace(/\n{2,}/g, ". ").replace(/\n/g, ", ");
+
+  // Sana formati 2026-09-01 -> tabiiy o'qilishi
+  const UZ_MONTHS = ["", "yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul", "avgust", "sentabr", "oktabr", "noyabr", "dekabr"];
+  s = s.replace(/\b(\d{4})-(\d{2})-(\d{2})\b/g, (_m, y, mo, d) =>
+    `${uzNumberToWords(+y)} yil ${uzNumberToWords(+d)} ${UZ_MONTHS[+mo] ?? ""}`.trim());
+
+  // Foiz
+  s = s.replace(/(\d[\d\s.,]*)\s*%/g, (_m, num) => `${numToUz(num)} foiz`);
+
+  // Pul: 1 500 000 so'm / UZS / mln / mlrd (kasrli qiymatlar ko'paytiriladi)
+  const scaled = (raw: string, mult: number, word: string) => {
+    const n = parseNum(raw);
+    if (n === null) return `${String(raw).trim()} ${word} so'm`;
+    return `${uzNumberToWords(n * mult)} so'm`;
+  };
+  s = s.replace(/(\d[\d\s.,]*)\s*(mlrd|milliard)\b/gi, (_m, num) => scaled(num, 1_000_000_000, "milliard"));
+  s = s.replace(/(\d[\d\s.,]*)\s*(mln|million)\b/gi, (_m, num) => scaled(num, 1_000_000, "million"));
+  s = s.replace(/(\d[\d\s.,]*)\s*(so'm|som|soʻm|UZS|uzs)\b/g, (_m, num) => `${numToUz(num)} so'm`);
+
+  // Qisqartmalar
+  s = s
+    .replace(/\bBOQ\b/g, "bi o kyu")
+    .replace(/\bPM\b/g, "loyiha rahbari")
+    .replace(/\bCEO\b/gi, "bosh direktor")
+    .replace(/\bHR\b/g, "kadrlar bo'limi")
+    .replace(/\bKPI\b/gi, "ko'rsatkich")
+    .replace(/\bPDF\b/gi, "pi di ef")
+    .replace(/\bAI\b/g, "sun'iy intellekt")
+    .replace(/\bt\/r\b/gi, "tartib raqami")
+    .replace(/\bdona\b/g, "dona")
+    .replace(/\bkv\.?m\b/gi, "kvadrat metr")
+    .replace(/\bm2\b/gi, "kvadrat metr")
+    .replace(/\bm3\b/gi, "kub metr")
+    .replace(/\bkg\b/g, "kilogramm")
+    .replace(/\bsht\b/gi, "dona");
+
+  // Qolgan sonlarni so'zga aylantirish
+  s = s.replace(/\d[\d\s.,]*\d|\d/g, (m) => numToUz(m));
+
+  // Tabiiy pauzalar va tozalash
+  s = s
+    .replace(/\s*:\s*/g, " — ")
+    .replace(/\s*—\s*([,.;])/g, "$1")
+    .replace(/\s*;\s*/g, ", ")
+    .replace(/\s+([,.!?])/g, "$1")
+    .replace(/([,.!?]){2,}/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (s && !/[.!?]$/.test(s)) s += ".";
+  return s;
+}
+
+function parseNum(raw: string): number | null {
+  const cleaned = String(raw)
+    .trim()
+    .replace(/\s/g, "")
+    .replace(/,(?=\d{3}\b)/g, "")
+    .replace(/\.(?=\d{3}\b)/g, "")
+    .replace(",", ".")
+    .replace(/[.,]$/, "");
+  const n = Number(cleaned);
+  return isFinite(n) && cleaned !== "" ? n : null;
+}
+
+function numToUz(raw: string): string {
+  const n = parseNum(raw);
+  if (n === null) return String(raw).trim();
+  return uzNumberToWords(n);
+}
+
 // ---------- Aisha TTS (o'zbek tilida ovozli javob) ----------
-async function aishaTts(text: string): Promise<ArrayBuffer | null> {
+// UzbekVoice.ai TTS — o'zbek tilida tabiiy ovoz
+export async function aishaTts(text: string): Promise<ArrayBuffer | null> {
   const apiKey = process.env.AISHA_API_KEY;
   if (!apiKey) {
-    console.warn("[aisha] AISHA_API_KEY yo'q");
+    console.warn("[uzbekvoice] API kalit yo'q");
     return null;
   }
-  const clean = text
-    .replace(/<[^>]+>/g, " ")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/[*_#>`|]/g, " ")
-    .replace(/\[(.*?)\]\(.*?\)/g, "$1")
-    .replace(/[⚠️✅❌🔴🟠🟢🚨⚡️🎧📝🤔🔇]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 900);
+  const clean = naturalizeUzbekForTts(text).slice(0, 900);
   if (!clean) {
-    console.warn("[aisha] bo'sh matn");
+    console.warn("[uzbekvoice] bo'sh matn");
     return null;
   }
   try {
-    const form = new FormData();
-    form.append("transcript", clean);
-    form.append("language", "uz");
-    form.append("model", "Gulnoza");
-    form.append("mood", "Neutral");
-    form.append("speed", "1.0");
-    const res = await fetch("https://back.aisha.group/api/v1/tts/post/", {
+    const res = await fetch("https://uzbekvoice.ai/api/v1/tts", {
       method: "POST",
-      headers: { "X-Api-Key": apiKey, "Accept-Language": "uz" },
-      body: form,
+      headers: { Authorization: apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: clean, model: "sevinch" }),
     });
     if (!res.ok) {
-      console.warn("[aisha] tts failed", res.status, await res.text().catch(() => ""));
+      console.warn("[uzbekvoice] tts failed", res.status, await res.text().catch(() => ""));
       return null;
     }
-    const ctype = res.headers.get("content-type") ?? "";
-    if (!ctype.includes("application/json")) {
-      return await res.arrayBuffer();
-    }
-    const j = (await res.json().catch(() => null)) as { audio_path?: string } | null;
-    if (!j?.audio_path) {
-      console.warn("[aisha] audio_path yo'q", JSON.stringify(j));
+    const j = (await res.json().catch(() => null)) as
+      | { result?: { url?: string }; status?: string }
+      | null;
+    const url = j?.result?.url;
+    if (!url) {
+      console.warn("[uzbekvoice] audio url yo'q", JSON.stringify(j));
       return null;
     }
-    const url = j.audio_path.startsWith("http")
-      ? j.audio_path
-      : `https://back.aisha.group${j.audio_path}`;
-    const audioRes = await fetch(url, { headers: { "X-Api-Key": apiKey } });
+    const audioRes = await fetch(url);
     if (!audioRes.ok) {
-      console.warn("[aisha] audio fetch failed", audioRes.status);
+      console.warn("[uzbekvoice] audio fetch failed", audioRes.status);
       return null;
     }
     return await audioRes.arrayBuffer();
   } catch (e) {
-    console.warn("[aisha] tts exception", e);
+    console.warn("[uzbekvoice] tts exception", e);
+    return null;
+  }
+}
+
+// WAV (PCM 16-bit) → MP3. Telegram sendVoice MP3 ni rasman qabul qiladi va tiniq ijro etadi
+// (WAV ni "ogg" deb yuborish ovozni qotirib/buzib qo'yardi).
+async function wavToMp3(wav: ArrayBuffer): Promise<Uint8Array | null> {
+  try {
+    const dv = new DataView(wav);
+    if (dv.getUint32(0, false) !== 0x52494646) return null; // "RIFF"
+    let off = 12, channels = 1, rate = 24000, bits = 16, dataOff = 0, dataLen = 0;
+    while (off + 8 <= dv.byteLength) {
+      const id = dv.getUint32(off, false), size = dv.getUint32(off + 4, true);
+      if (id === 0x666d7420) { channels = dv.getUint16(off + 10, true); rate = dv.getUint32(off + 12, true); bits = dv.getUint16(off + 22, true); }
+      else if (id === 0x64617461) { dataOff = off + 8; dataLen = Math.min(size, dv.byteLength - dataOff); break; }
+      off += 8 + size + (size % 2);
+    }
+    if (!dataOff || bits !== 16) return null;
+    const total = Math.floor(dataLen / 2 / channels);
+    const mono = new Int16Array(total);
+    for (let i = 0; i < total; i++) mono[i] = dv.getInt16(dataOff + i * 2 * channels, true);
+    const { Mp3Encoder } = await import("@breezystack/lamejs");
+    const enc = new Mp3Encoder(1, rate, 64);
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < total; i += 1152) {
+      const b = enc.encodeBuffer(mono.subarray(i, i + 1152));
+      if (b.length) parts.push(new Uint8Array(b));
+    }
+    const end = enc.flush();
+    if (end.length) parts.push(new Uint8Array(end));
+    const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+    let p = 0; for (const x of parts) { out.set(x, p); p += x.length; }
+    return out;
+  } catch (e) {
+    console.warn("[tts] mp3 encode failed", e);
     return null;
   }
 }
 
 async function sendVoice(chat_id: number, audio: ArrayBuffer, caption?: string): Promise<boolean> {
-  // Avval Telegramning haqiqiy voice bubble (sendVoice) sifatida yuborishga urinamiz.
-  // Aisha WAV qaytaradi — Telegram sendVoice rasman OGG/OPUS kutadi, lekin ko'p hollarda WAV ham qabul qilinadi.
-  // Muvaffaqiyatsiz bo'lsa — sendAudio (play tugmasi bilan audio fayl) ga o'tamiz.
+  const mp3 = await wavToMp3(audio);
   const tryEndpoint = async (endpoint: "sendVoice" | "sendAudio"): Promise<boolean> => {
     const form = new FormData();
     form.append("chat_id", String(chat_id));
@@ -110,8 +253,8 @@ async function sendVoice(chat_id: number, audio: ArrayBuffer, caption?: string):
       form.append("parse_mode", "HTML");
     }
     const field = endpoint === "sendVoice" ? "voice" : "audio";
-    const filename = endpoint === "sendVoice" ? "aisha.ogg" : "aisha.wav";
-    form.append(field, new Blob([audio], { type: "audio/ogg" }), filename);
+    if (mp3) form.append(field, new Blob([mp3 as BlobPart], { type: "audio/mpeg" }), "fina.mp3");
+    else form.append(field, new Blob([audio], { type: "audio/wav" }), "fina.wav");
     try {
       const r = await fetch(`${TG_API}/${endpoint}`, { method: "POST", body: form });
       if (!r.ok) {
@@ -129,19 +272,56 @@ async function sendVoice(chat_id: number, audio: ArrayBuffer, caption?: string):
 }
 
 // ---------- Asosiy klaviatura ----------
-const AI_ROLES = ["admin", "pm", "direktor"] as const;
+const AI_ROLES = ["admin", "pm", "direktor", "ceo"] as const;
 const aiAllowedByChat = new Map<number, boolean>();
+const ceoOnlyByChat = new Map<number, boolean>();
+type BotButtonKey = "project" | "fuel" | "ledger" | "dpr" | "hr" | "innoai";
+const ALL_BOT_BUTTONS: BotButtonKey[] = ["project", "fuel", "ledger", "dpr", "hr", "innoai"];
+const buttonAccessByChat = new Map<number, Set<BotButtonKey>>();
 
-async function checkAiAccess(uid: number): Promise<boolean> {
+async function getTgRoles(uid: number): Promise<string[]> {
   try {
     const { data: prof } = await admin()
       .from("profiles").select("id").eq("telegram_user_id", uid).maybeSingle();
-    if (!prof?.id) return false;
-    const { data } = await admin()
-      .from("user_roles").select("role").eq("user_id", prof.id).in("role", AI_ROLES as any);
-    return (data ?? []).length > 0;
-  } catch { return false; }
+    if (!prof?.id) return [];
+    const { data } = await admin().from("user_roles").select("role").eq("user_id", prof.id);
+    return (data ?? []).map((r: any) => String(r.role));
+  } catch { return []; }
 }
+
+async function checkAiAccess(uid: number): Promise<boolean> {
+  const roles = await getTgRoles(uid);
+  return roles.some((r) => (AI_ROLES as readonly string[]).includes(r));
+}
+
+/** Faqat CEO (admin/finans emas) — botda faqat AI savol-javob rejimi. */
+async function checkCeoOnly(uid: number): Promise<boolean> {
+  const roles = await getTgRoles(uid);
+  if (roles.includes("admin") || roles.includes("finans")) return false;
+  return roles.includes("ceo");
+}
+
+async function loadButtonAccess(chatId: number, uid: number): Promise<Set<BotButtonKey>> {
+  if (isGroupChat(chatId)) return new Set();
+  const sb = admin();
+  const { data: profile } = await sb.from("profiles").select("id").eq("telegram_user_id", uid).maybeSingle();
+  if (!profile?.id) return new Set();
+  const roles = await getTgRoles(uid);
+  const { data } = await sb.from("user_bot_permissions").select("button_key").eq("user_id", profile.id);
+  const keys = new Set<BotButtonKey>();
+  for (const row of data ?? []) {
+    const key = String((row as any).button_key) as BotButtonKey;
+    if (ALL_BOT_BUTTONS.includes(key)) keys.add(key);
+  }
+  if (roles.includes("ceo") && !roles.includes("admin") && !roles.includes("finans")) return new Set(["innoai"]);
+  // Hech qanday tugma biriktirilmagan bo'lsa — standart: admin/finans hammasi, boshqalar Daftar.
+  if (keys.size === 0) {
+    if (roles.includes("admin") || roles.includes("finans")) ALL_BOT_BUTTONS.forEach((key) => keys.add(key));
+    else keys.add("ledger");
+  }
+  return keys;
+}
+
 
 const projectNameByChat = new Map<number, string>();
 // Joriy ko'rsatilayotgan loyiha-picker ro'yxati (chat bo'yicha): tugma matni -> project_id
@@ -162,31 +342,141 @@ type SmetaPickItem = {
 };
 const smetaPickByChat = new Map<number, Map<string, SmetaPickItem>>();
 
-// Diqqat tortuvchi emoji — har safar yangilanganida almashadi (o'chib-yonish effekti)
-const BLINK_EMOJI = ["🔴", "🟠", "🚨", "⚡️"];
-function blinkEmoji() {
-  return BLINK_EMOJI[Math.floor(Date.now() / 1000) % BLINK_EMOJI.length];
+
+/** Telegramda guruh/superguruh chat_id har doim manfiy bo'ladi. */
+function isGroupChat(chatId?: number | null): boolean {
+  return typeof chatId === "number" && chatId < 0;
 }
 
-function mainMenu(draftCount = 0, chatId?: number) {
-  const pname = chatId ? projectNameByChat.get(chatId) : undefined;
-  const headerRow = pname
-    ? [{ text: `🏗 ${pname} /Loyihalar` }]
-    : [{ text: `${blinkEmoji()} LOYIHANI TANLANG! /Loyihalar` }];
+function mainMenu(draftCount = 0, _chatId?: number) {
+  // Guruhda hech qanday tugma chiqmaydi — guruh faqat xarajat yozish uchun.
+  if (isGroupChat(_chatId)) return undefined;
+  const allowed = buttonAccessByChat.get(_chatId ?? 0) ?? new Set<BotButtonKey>();
+  const buttons: Array<{ key: BotButtonKey; text: string }> = [
+    { key: "project", text: "📊 Loyiha" },
+    { key: "fuel", text: "⛽ Salyarka" },
+    { key: "ledger", text: `📒 Daftar (${draftCount})` },
+    { key: "dpr", text: "📄 DPR" },
+    { key: "hr", text: "👥 HR" },
+    { key: "innoai", text: "✨ Fina" },
+  ];
+  const visible = buttons.filter((button) => allowed.has(button.key));
+  const keyboard: Array<Array<{ text: string }>> = [];
+  for (let index = 0; index < visible.length; index += 2) {
+    keyboard.push(visible.slice(index, index + 2).map((button) => ({ text: button.text })));
+  }
   return {
-    keyboard: [
-      headerRow,
-      [
-        { text: `📒 Daftar (${draftCount})` },
-        { text: "📍 Davomat (lokatsiya)", request_location: true },
-      ],
-      [
-        { text: "📋 Smeta" }, { text: "💼 Buxgalteriya" },
-      ],
-    ],
+    keyboard,
     resize_keyboard: true,
   };
 }
+
+function canUseButton(chatId: number, key: BotButtonKey): boolean {
+  return buttonAccessByChat.get(chatId)?.has(key) === true;
+}
+
+let botCommandsSynced = false;
+async function removeAiFromCommandMenu() {
+  if (botCommandsSynced) return;
+  botCommandsSynced = true;
+  try {
+    const current = await tg("getMyCommands", {});
+    const commands = Array.isArray(current?.result)
+      ? current.result.filter((command: any) => String(command?.command ?? "").toLowerCase() !== "ai")
+      : [];
+    await tg("setMyCommands", { commands });
+  } catch (error) {
+    console.warn("[tg] AI command menu cleanup failed", error);
+  }
+}
+
+/** Salyarka xabaridan litr yozuvlarini ajratadi (summa yo'q). */
+async function aiJsonObject(key: string, system: string, raw: string): Promise<any | null> {
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "google/gemini-3.7-flash",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: raw },
+      ],
+    }),
+  });
+  if (!res.ok) return null;
+  const j: any = await res.json();
+  return JSON.parse(String(j?.choices?.[0]?.message?.content ?? "{}").replace(/^```json|```$/g, ""));
+}
+
+async function aiParseFuel(raw: string): Promise<{ date: string; type: string; tech: string; driver: string; liters: number; note: string }[]> {
+  const key = process.env.LOVABLE_API_KEY;
+  if (!key) return [];
+  const today = new Date(Date.now() + 5 * 3600_000).toISOString().slice(0, 10);
+  try {
+    const parsed = await aiJsonObject(key, `Salyarka (dizel) hisobi. Bugun ${today}. Xabardan yozuvlarni ajrat va faqat JSON qaytar: {"items":[{"date":"YYYY-MM-DD","type":"CHIQIM|KIRIM","tech":"Texnika nomi va raqami (masalan Ekskavator 871)","driver":"haydovchi ismi yoki bo'sh","liters":raqam,"note":"qo'shimcha izoh yoki bo'sh"}]}. Texnikaga quyildi = CHIQIM; bazaga keldi/olindi = KIRIM. «kecha» bo'lsa sanani bir kun oldin qil. Summa/narx yozma. O'zingdan so'z qo'shma.`, raw);
+    if (!parsed) return [];
+    return ((parsed.items ?? []) as any[])
+      .map((e) => ({
+        date: String(e.date || today),
+        type: String(e.type).toUpperCase() === "KIRIM" ? "KIRIM" : "CHIQIM",
+        tech: String(e.tech ?? "").trim(),
+        driver: String(e.driver ?? "").trim(),
+        liters: Number(e.liters) || 0,
+        note: String(e.note ?? "").trim(),
+      }))
+      .filter((e) => e.liters > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function aiParseHr(raw: string): Promise<{ date: string; type: string; name: string; role: string; project: string; note: string }[]> {
+  const key = process.env.LOVABLE_API_KEY;
+  if (!key) return [];
+  const today = new Date(Date.now() + 5 * 3600_000).toISOString().slice(0, 10);
+  try {
+    const parsed = await aiJsonObject(key, `HR (kadrlar/davomat) hisobi. Bugun ${today}. Xabardan yozuvlarni ajrat va faqat JSON qaytar: {"items":[{"date":"YYYY-MM-DD","type":"DAVOMAT|KELMADI|QABUL|CHIQDI|BOSHQA","name":"xodim ismi","role":"lavozim yoki bo'sh","project":"loyiha nomi yoki bo'sh","note":"izoh yoki bo'sh"}]}. Ishga keldi/ishda = DAVOMAT; kelmadi/kasal/ta'til = KELMADI; ishga qabul qilindi = QABUL; ishdan ketdi/chiqarildi = CHIQDI. «kecha» bo'lsa sanani bir kun oldin qil. O'zingdan so'z qo'shma.`, raw);
+    if (!parsed) return [];
+    return ((parsed.items ?? []) as any[])
+      .map((e) => ({
+        date: String(e.date || today),
+        type: String(e.type ?? "DAVOMAT").toUpperCase(),
+        name: String(e.name ?? "").trim(),
+        role: String(e.role ?? "").trim(),
+        project: String(e.project ?? "").trim(),
+        note: String(e.note ?? "").trim(),
+      }))
+      .filter((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+async function aiParseDpr(raw: string): Promise<{ date: string; direction: string; block: string; work: string; qty: number; unit: string; note: string }[]> {
+  const key = process.env.LOVABLE_API_KEY;
+  if (!key) return [];
+  const today = new Date(Date.now() + 5 * 3600_000).toISOString().slice(0, 10);
+  try {
+    const parsed = await aiJsonObject(key, `DPR — qurilishdagi kunlik bajarilgan ish hajmi hisobi (pul emas!). Bugun ${today}. Xabardan yozuvlarni ajrat va faqat JSON qaytar: {"items":[{"date":"YYYY-MM-DD","direction":"yo'nalish (Tracker, Blok, Inshoot va h.k.) yoki bo'sh","block":"blok raqami yoki bo'sh","work":"ish turi / komponent nomi","qty":0,"unit":"o'lchov birligi (dona, m, m2, m3, kg, ta va h.k.)","note":"izoh yoki bo'sh"}]}. «kecha» bo'lsa sanani bir kun oldin qil. Summa/so'm yozma — bu yerda faqat hajm. O'zingdan so'z qo'shma.`, raw);
+    if (!parsed) return [];
+    return ((parsed.items ?? []) as any[])
+      .map((e) => ({
+        date: String(e.date || today),
+        direction: String(e.direction ?? "").trim(),
+        block: String(e.block ?? "").trim(),
+        work: String(e.work ?? "").trim(),
+        qty: Number(e.qty) || 0,
+        unit: String(e.unit ?? "").trim(),
+        note: String(e.note ?? "").trim(),
+      }))
+      .filter((e) => e.work || e.direction);
+  } catch {
+    return [];
+  }
+}
+
+
 
 function smetaMenu() {
   return {
@@ -244,7 +534,7 @@ function chatMenu() {
 
 
 // ---------- AI agent (loyiha bo'yicha savol-javob) ----------
-async function askAgent(history: { role: "user" | "assistant"; content: string }[], project_id: string | null, client?: "voice" | "mobile" | "web"): Promise<string> {
+async function askAgent(history: { role: "user" | "assistant"; content: string }[], project_id: string | null, client: "voice" | "mobile" | "web" | undefined, telegram_user_id: number): Promise<string> {
   try {
     const url = `${process.env.SUPABASE_URL}/functions/v1/ai-agent`;
     const res = await fetch(url, {
@@ -253,11 +543,67 @@ async function askAgent(history: { role: "user" | "assistant"; content: string }
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
       },
-      body: JSON.stringify({ messages: history, project_id, client: client ?? "mobile" }),
+      body: JSON.stringify({ messages: history, project_id, client: client ?? "mobile", telegram_user_id }),
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) return `⚠️ ${j?.error ?? "AI xato"}`;
     return (j?.reply ?? "").toString().trim() || "🤔 Javob bo'sh.";
+  } catch (e: any) {
+    return `⚠️ Tarmoq xatosi: ${e?.message ?? e}`;
+  }
+}
+
+// Sheet asosidagi javob: faqat berilgan jadval ma'lumotiga tayanadi (bazaga murojaat yo'q),
+// shunda raqamlar Sheet bilan aynan bir xil bo'ladi.
+async function askSheetAi(
+  prev: { role: "user" | "assistant"; content: string }[],
+  ctx: string,
+  question: string,
+  voice: boolean,
+): Promise<string> {
+  const key = process.env.LOVABLE_API_KEY;
+  if (!key) return "⚠️ AI kaliti sozlanmagan.";
+  const nowT = new Date();
+  const todayIso = nowT.toISOString().slice(0, 10);
+  const yesterdayIso = new Date(nowT.getTime() - 864e5).toISOString().slice(0, 10);
+  const system = `Bugun: ${todayIso}. Kecha: ${yesterdayIso}.
+Sen Fina — shu firmaning loyiha boshqaruvchisi va CEOlar uchun aniq tahliliy yordamchisan. O'zingni barcha loyihalarning holati, kassa xarajatlari va salyarka harakatlarini berilgan manbalar doirasida biladigan mas'ul rahbar sifatida tut. MANBA 1 — naqd kassa (so'm), MANBA 2 — salyarka (litr, texnika, haydovchi).
+QAT'IY QOIDALAR:
+0. Salyarka/litr/texnika/haydovchi sarfi so'ralsa — MANBA 2 (SALYARKA QIDIRUV) dan litrda javob ber. Pul so'ralsa — MANBA 1. Litr va so'mni aralashtirma.
+1. FAQAT pastdagi JADVAL MA'LUMOTLARI dan foydalan. Raqam o'ylab topma, taxmin qilma.
+2. Summa so'ralsa — QIDIRUV blokidagi «JAMI CHIQIM/JAMI KIRIM» raqamini aynan ko'chir, o'zing qayta qo'shma.
+3. Umumiy kassa/jami savollarda — JAMI KIRIM, JAMI CHIQIM, KASSA QOLDIQ qatorlarini ishlat.
+4. Topilgan yozuvlar sonini ayt. Kerak bo'lsa 3-5 ta misol yozuvni qator raqami (#) bilan ko'rsat.
+5. QIDIRUV «topilmadi» desa yoki izohda «to'liq mos yozuv yo'q» bo'lsa — buni ochiq ayt.
+6. Savol noaniq bo'lsa (masalan qaysi oy ekanligi), qisqa aniqlashtiruvchi savol ber.
+7. Summalarni bo'sh joy bilan yoz: 6 255 000 so'm.
+8. SANA QOIDASI: yilni HECH QACHON aytma (2026 deb yozma). «Bugun» so'ralsa — «bugun», «kecha» so'ralsa — «kecha» deb ayt. Aniq sana so'ralsa yoki sanani ko'rsatish kerak bo'lsa — faqat kun va oyni ayt: «30-sentabr», «12-iyul».
+9. TAHLIL/SHUBHA/NARX FARQI so'ralsa — «TAHLIL» blokidan foydalan. Narx farqi so'ralsa «BIR XIL MAHSULOT — HAR XIL NARX» ro'yxatidan eng muhim 3-6 mahsulotni ayt: eng arzon va eng qimmat narx, qator raqami (#), farq % va tejalishi mumkin bo'lgan summa. Shubha so'ralsa — 3-5 shubhali yozuvni # bilan, NIMA UCHUN shubhali ekanini (takroriy, narx baland, katta summa, hisob mos emas, mas'ul/izoh yo'q) qisqa tushuntir. Hech qachon «yozuv yo'q», «qaysi mahsulot?» deb qaytarma — TAHLIL bloki bor bo'lsa undan javob ber. Ayblama: «tekshirib ko'rish kerak» ohangida yoz.
+10. MASLAHATNI FAQAT foydalanuvchi aynan «maslahat ber», «tavsiya ber» yoki «nima qilish kerak?» deb so'raganda ber. Oddiy savol, hisobot, tahlil, shubhali xarajat yoki narx farqi javobiga o'zingdan maslahat qo'shma. Maslahat so'ralsa, aniqlangan dalillarga tayangan 2-3 ta amaliy tavsiya ber.
+11. Har bir savolga avval to'g'ridan-to'g'ri xulosa bilan javob ber. Bir savoldagi loyihalar, oylar, summalar va birliklarni aralashtirma; har birini alohida qatorda aniq nomla. Ma'lumot yetmasa taxmin qilma, aynan qaysi ma'lumot yetishmasligini bitta jumlada ayt.
+12. «Qo'shimcha yozuv», «boshqa yozuvlar ham bor», «shu davrdagi barcha yozuvlar berildi» kabi iboralarni YOZMA va javobga so'ralmagan qo'shimcha yozuvlarni qo'shma — faqat so'ralgan narsaga javob ber. Bir xil son yoki summani javobda ikki marta takrorlama: jami aytilgan bo'lsa, qayta yozma.
+${voice ? "OVOZ: 1-3 jumla, markdown yo'q. Summani O'ZBEKCHA TO'LIQ SO'Z BILAN, yagona ibora qilib ayt: «7 686 000 so'm → yetti million olti yuz sakson ming so'm», «6 255 000 so'm → olti million ikki yuz ellik besh ming so'm». «Sum/so'm» so'zini faqat ENG OXIRIDA 1 marta ayt, har bir qismdan keyin takrorlama (hech qachon «7 million sum 680 ming sum» kabi ajratma). Raqamlarni raqam bilan emas, so'z bilan o'qiydigan ko'rinishda yoz." : "YOZMA JAVOB: telefon ekraniga mos, tartibli va ixcham yoz. Jadval ishlatma. Birinchi qatorda aniq javob yoki xulosa bo'lsin. Keyin kerak bo'lsa qisqa sarlavha va har bir faktni alohida • belgili qatorda yoz. 2-8 qator yetarli; asosiy summa yoki natijani **bold** qil. Bir fikrni takrorlama, uzun tartibsiz paragraf yozma."}
+
+JADVAL MA'LUMOTLARI:
+${ctx}`;
+  try {
+    const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "google/gemini-3.7-flash",
+        messages: [
+          { role: "system", content: system },
+          ...prev.slice(-6),
+          { role: "user", content: question },
+        ],
+      }),
+    });
+    if (res.status === 429) return "⚠️ AI band. Bir oz kutib qayta so'rang.";
+    if (res.status === 402) return "⚠️ AI krediti tugagan.";
+    if (!res.ok) return `⚠️ AI xatosi: ${res.status}`;
+    const j: any = await res.json();
+    return String(j?.choices?.[0]?.message?.content ?? "").trim() || "🤔 Javob bo'sh.";
   } catch (e: any) {
     return `⚠️ Tarmoq xatosi: ${e?.message ?? e}`;
   }
@@ -282,7 +628,7 @@ type Session = {
 };
 async function getSession(chat_id: number, uid: number, username: string | null): Promise<Session> {
   const sb = admin();
-  const { data } = await sb.from("telegram_sessions").select("*").eq("chat_id", chat_id).maybeSingle();
+  const { data } = await sb.from("telegram_sessions").select("chat_id,telegram_user_id,username,flow,step,data").eq("chat_id", chat_id).maybeSingle();
   if (data) return data as Session;
   const fresh: Session = { chat_id, telegram_user_id: uid, username, flow: null, step: null, data: { draft: [] } };
   await sb.from("telegram_sessions").upsert(fresh);
@@ -303,28 +649,50 @@ async function loadMaster(kind: "material" | "work") {
 }
 
 // ---------- Fayl yuklash ----------
-async function uploadFile(file_id: string, prefix: string): Promise<{ url: string; bytes: Uint8Array; mime: string } | null> {
+async function uploadFile(file_id: string, prefix: string): Promise<{ url: string; dataUrl: string; bytes: Uint8Array; mime: string } | null> {
   try {
     const r = await fetch(`${TG_API}/getFile?file_id=${file_id}`).then((x) => x.json());
     const path = r?.result?.file_path;
     if (!path) return null;
     const fileRes = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${path}`);
     const buf = new Uint8Array(await fileRes.arrayBuffer());
-    const ext = path.split(".").pop() || "bin";
-    const mime = fileRes.headers.get("content-type") || "application/octet-stream";
+    const ext = (path.split(".").pop() || "bin").toLowerCase();
+    const EXT_MIME: Record<string, string> = {
+      jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp",
+      gif: "image/gif", heic: "image/heic", bmp: "image/bmp", pdf: "application/pdf",
+      oga: "audio/ogg", ogg: "audio/ogg", mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav",
+    };
+    const hdrMime = (fileRes.headers.get("content-type") || "").split(";")[0].trim();
+    const mime =
+      EXT_MIME[ext] ??
+      (hdrMime && hdrMime !== "application/octet-stream" ? hdrMime : "image/jpeg");
+
     const key = `${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const sb = admin();
     const { error } = await sb.storage.from("telegram-files").upload(key, buf, { contentType: mime });
     if (error) return null;
     const url = sb.storage.from("telegram-files").getPublicUrl(key).data.publicUrl;
-    return { url, bytes: buf, mime };
+    // Bucket private — AI public URL'ni ocholmaydi, shuning uchun base64 data URL ham qaytaramiz
+    let bin = "";
+    for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+    const dataUrl = `data:${mime};base64,${btoa(bin)}`;
+    return { url, dataUrl, bytes: buf, mime };
   } catch {
     return null;
   }
 }
 
 // ---------- Lovable AI ----------
+let lastAiError: string | null = null;
+
+function aiErrorText(status: number, body: string): string {
+  if (status === 402) return "AI krediti tugagan. Lovable workspace'da kredit to'ldiring.";
+  if (status === 429) return "AI band (limit). Biroz kutib qayta urinib ko'ring.";
+  return `AI xatolik (${status}): ${body.slice(0, 200)}`;
+}
+
 async function callAi(systemPrompt: string, userParts: any[], model = "google/gemini-2.5-flash"): Promise<any | null> {
+  lastAiError = null;
   try {
     const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
@@ -339,122 +707,248 @@ async function callAi(systemPrompt: string, userParts: any[], model = "google/ge
       }),
     });
     if (!res.ok) {
-      console.error("AI error", res.status, await res.text());
+      const body = await res.text();
+      console.error("AI error", res.status, body);
+      lastAiError = aiErrorText(res.status, body);
       return null;
     }
     const j = await res.json();
     const txt: string = j?.choices?.[0]?.message?.content ?? "";
     const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { lastAiError = "AI javobini o'qib bo'lmadi."; return null; }
     return JSON.parse(m[0]);
   } catch (e) {
     console.error("ai parse", e);
+    lastAiError = "AI bilan bog'lanib bo'lmadi.";
     return null;
   }
 }
 
+
+// UzbekVoice.ai STT — o'zbekcha ovozni matnga aylantirish
 async function transcribeAudio(bytes: Uint8Array, mime: string): Promise<string | null> {
+  const apiKey = process.env.AISHA_API_KEY;
+  if (!apiKey) {
+    console.error("[uzbekvoice] stt API kalit yo'q");
+    return null;
+  }
   try {
-    let bin = "";
-    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    const b64 = btoa(bin);
-    const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    const ext = mime.includes("ogg") ? "ogg" : mime.includes("wav") ? "wav" : mime.includes("mp4") || mime.includes("m4a") ? "m4a" : "mp3";
+    const form = new FormData();
+    form.append("file", new Blob([bytes as unknown as BlobPart], { type: mime }), `voice.${ext}`);
+    form.append("return_offsets", "false");
+    form.append("run_diarization", "false");
+    form.append("blocking", "true");
+    form.append("language", "uz");
+    const res = await fetch("https://uzbekvoice.ai/api/v1/stt", {
       method: "POST",
-      headers: { Authorization: `Bearer ${LOVABLE_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          { role: "system", content: "Audio dan o'zbek tilida matnga aylantir. Faqat matnni qaytar." },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "Quyidagi audioni transkripsiya qil:" },
-              { type: "input_audio", input_audio: { data: b64, format: mime.includes("ogg") ? "ogg" : "mp3" } } as any,
-            ],
-          },
-        ],
-      }),
+      headers: { Authorization: apiKey },
+      body: form,
     });
-    if (!res.ok) return null;
-    const j = await res.json();
-    return j?.choices?.[0]?.message?.content?.trim() ?? null;
-  } catch {
+    if (!res.ok) {
+      console.error("[uzbekvoice] stt failed", res.status, await res.text().catch(() => ""));
+      return null;
+    }
+    const j = (await res.json().catch(() => null)) as { result?: { text?: string } } | null;
+    return (j?.result?.text ?? "").trim() || null;
+  } catch (e) {
+    console.error("[uzbekvoice] stt exception", e);
     return null;
   }
 }
 
 // ---------- AI prompt ----------
-function autoPrompt(materials: any[], works: any[], categories: string[]) {
-  const ml = materials.slice(0, 200).map((c: any) => `${c.id}|${c.name} (${c.unit})`).join("\n");
-  const wl = works.slice(0, 200).map((c: any) => `${c.id}|${c.name} (${c.unit})`).join("\n");
-  const catList = categories.length ? categories.join("|") : "Boshqa";
-  return `Sen qurilish loyihasi yordamchi AI sisan. Foydalanuvchi xabarini (matn/ovoz/rasm) o'qib HAR BIR yozuvni KATEGORIYAga ajratib JSON qaytar.
+const SHEET_EXPENSE_CATEGORIES = [
+  "Oziq-ovqat",
+  "Qurilish materiallari",
+  "Boshqa",
+  "Yoqilg‘i",
+  "Texnika",
+  "oylik",
+  "Texnika xavfsizligi",
+  "Usta",
+  "Yetkazib berish",
+  "Ijara",
+  "Transfer",
+] as const;
 
-FAQAT 4 KATEGORIYA (kind):
-- "zayavka" — material/ish so'rov: "menga 50 qop sement kerak", "armatura olishimiz kerak".
-- "material" — material AYNI PAYTDA omborga keldi/qabul qilindi: "5 qop sement keldi 65000 dan".
-- "expense" — pul XARAJATI (chiqim): "yo'l puli berdim", "benzin 200ming", "ovqat 50ming".
-- "income" — KIRIM PUL (kassaga pul keldi). MUHIM: "kirim", "pul oldim", "pul keldi", "prixod", "приход", "kassaga tushdi", "tushdi", "to'lov keldi", "investitsiya keldi", "avans oldik", "mijoz to'ladi" — bularning hammasi income. Bu xarajat EMAS, bu kirim.
+function normalizeSheetCategory(category: unknown, description: unknown): string {
+  const text = `${String(category ?? "")} ${String(description ?? "")}`.toLocaleLowerCase("uz");
+  if (/transfer|podotchet|xodimga\s*berild/.test(text)) return "Transfer";
+  if (/oziq|ovqat|non|ichimlik|obed|tushlik|kechki/.test(text)) return "Oziq-ovqat";
+  if (/texnika\s*xavfsiz|xavfsizlik|siz|kaska|jilet|qo['‘’`]?lqop/.test(text)) return "Texnika xavfsizligi";
+  if (/benzin|salyarka|dizel|yoqilg|metan|propan/.test(text)) return "Yoqilg‘i";
+  if (/qurilish\s*material|material|sement|armatura|g['‘’`]?isht|beton|elektrod|izolenta/.test(text)) return "Qurilish materiallari";
+  if (/yetkaz|dostav|transport/.test(text)) return "Yetkazib berish";
+  if (/ijara|arenda/.test(text)) return "Ijara";
+  if (/oylik|maosh|xodim/.test(text)) return "oylik";
+  if (/usta|brigada|avans/.test(text)) return "Usta";
+  if (/texnika|ekskavator|kran|traktor|moyka|remont/.test(text)) return "Texnika";
+  return "Boshqa";
+}
 
-QOIDALAR:
-- Bitta xabarda har xil yozuvlar bo'lishi mumkin — har birini alohida item qil.
-- Material/zayavka uchun katalogdan eng mos master_id ni TOPISHGA HARAKAT QIL. Mos kelmasa null va off_plan: true.
-- Expense uchun category FAQAT quyidagi ro'yxatdan tanla: ${catList}. Hech qaysi mos kelmasa "Boshqa".
-- Income uchun payment_method: "bank/karta/plastik/o'tkazma/перевод" → "Bank"; aks holda "Naqd".
-- TIL: matn o'zbek (lotin/kirill), rus, ingliz tillarida bo'lishi mumkin. Tarjima qil: "excavation"="kovlash", "concrete"="beton", "rebar"="armatura", "brick"="g'isht", "cement"="sement", "sand"="qum", "gravel"="shag'al", "plaster"="shtukaturka", "paint"="bo'yoq", "tile"="plitka", "transport"="transport", "labor"="ish haqi". Imlo xatolari va qisqartmalarni tushun.
-- AGAR matn QURILISH ISHI yoki MATERIALga o'xshasa (masalan: "kovlash 100 m3", "excavation 20m3", "beton quyish 5m3") — ALBATTA "zayavka" sifatida qaytar (z_kind="work" ish uchun, "material" material uchun), name=ish/material nomi (o'zbekchaga tarjima qil), qty va unit ni matndan oling. HECH QACHON bo'sh items qaytarmang agar matnda biror raqam va so'z bo'lsa.
-- AGAR umuman tushunmasangiz HAM, eng yaqin "expense" item qaytaring (description=matnning o'zi, amount=0).
+function autoPrompt(_materials: any[], _works: any[], categories: string[]) {
+  const catList = categories.length ? categories.join(" | ") : "Boshqa";
+  return `Sen qurilish loyihasining moliya yordamchisisan. Foydalanuvchi xabarini (matn/ovoz/rasm) o'qib HAR BIR yozuvni JSON qilib qaytar.
 
-Master material katalog (id|nom (birlik)):
-${ml || "(yo'q)"}
+FAQAT 2 TUR (kind):
+- "expense" — PUL CHIQIMI. Sotib olingan material, ovqat, benzin, texnika, usta puli, oylik, ijara — hammasi expense.
+- "income" — KASSAGA PUL KELISHI: "kirim", "pul oldim", "pul keldi", "prixod", "приход", "kassaga tushdi", "to'lov keldi", "investitsiya", "mijoz to'ladi".
 
-Master ish katalog (id|nom (birlik)):
-${wl || "(yo'q)"}
+"ombor", "zayavka", "material qabul", "ish bajarildi" kabi turlar YO'Q. Hech qachon ishlatma.
+
+HAR BIR expense uchun ANIQLA:
+- name: mahsulot/xizmat nomi + MUHIM aniqlovchi. Qisqa bo'lsin, lekin quyidagilarni HECH QACHON tashlab yuborma:
+  * TEXNIKA/MASHINA nomi aytilsa (Lacetti, Nexia, Damas, Kamaz, Greder, Ekskavator, Kran, Traktor, Pogruzchik, Betonmeshalka, Moyka...) — uni nomga qo'sh:
+    "metan lacettiga 100 ming" → name = "Metan (Lacetti)"
+    "ekskavatorga 80 litr salyarka" → name = "Salyarka (Ekskavator)"
+  * SHAXS ISMI aytilsa (oylik, avans, ish haqi, usta puli) — ismni nomda saqla:
+    "Golib greder 200000 oylik" → name = "G'olib (greder) — oylik"
+    "Ozod ustaga 500 ming avans" → name = "Ozod usta — avans"
+  * NIMA UCHUN / QAYERGA olingani aytilsa ("texnikaga benzin", "oshxonaga go'sht", "4-blokka sement", "lager uchun gaz") — maqsadni HECH QACHON tashlab ketma, qavsda yoz:
+    "texnikaga benzin 300 ming" → name = "Benzin (texnika)"
+    "oshxonaga 5 kg go'sht" → name = "Go'sht (oshxona)"
+    "Kamazga balon 1,2 mln" → name = "Balon (Kamaz)"
+  * Kategoriyani mahsulotga qarab tanla (benzin → yoqilg'i), lekin nomdagi maqsad/texnikani saqla.
+- O'ZINGDAN SO'Z QO'SHMA: foydalanuvchi aytmagan so'zlarni ("haydovchisi", "ishchisi", "uchun", "xizmati") qo'shish QAT'IY TAQIQLANADI. Faqat aytilgan so'zlarni tozalab ishlat.
+- Sana, "berildi", "olindi", "to'ladim" kabi fe'llarni nomga qo'shma.
+- qty (son) va unit (birlik): dona, kg, litr, qop, m, m2, m3, tonna, reys, kun, soat. Aytilmasa qty=1, unit="dona".
+- unit_price (dona narxi) va amount (umumiy summa).
+  * Faqat umumiy summa aytilsa: amount = shu summa, unit_price = amount / qty.
+  * Faqat dona narxi aytilsa ("10 qop 65 mingdan"): unit_price = 65000, amount = qty * unit_price.
+  * Ikkalasi ham aytilsa, ular mos kelmasa — ishonchli bo'lgani umumiy summa: amount to'g'ri deb ol, unit_price = amount / qty.
+- category: FAQAT shu ro'yxatdan: ${catList}. Mos kelmasa "Boshqa".
+- payment_method: "bank/karta/plastik/o'tkazma/перевод" → "Bank", aks holda "Naqd".
+- description: nomi + qisqa izoh (kim oldi, qayerga ketdi).
+
+TRANSFER (ichki pul berish): "@jasur_prorab ga 5 mln berdim", "Jasurga 2 mln pul berdim (xarajat uchun)" — bu loyiha xarajati EMAS, xodimga pul o'tkazish:
+  kind="expense", category="Transfer", name="Transfer → @jasur_prorab", paid_by="@jasur_prorab" (username yoki ism).
+  Xodim o'zi "pul oldim" desa ham bu income EMAS — Transfer.
+  Faqat mahsulot/xizmat sotib olinganda oddiy kategoriya ishlatiladi.
+
+SALYARKA / YOQILG'I (alohida litr hisobi):
+Agar xabarda texnikaga yoqilg'i (salyarka, dizel, solyarka) quyilgani yoki bazaga salyarka kelgani aytilsa, expense ichiga QO'SHIMCHA maydonlar qo'sh:
+  fuel_tech — texnika nomi/raqami aynan aytilganidek ("Ekskavator 871", "Greyder 231", "Pogruzchik 060", "Kara 469").
+  fuel_driver — haydovchi/mas'ul ismi aytilgan bo'lsa.
+  fuel_liters — litr miqdori (son).
+  fuel_type — "CHIQIM" (texnikaga quyildi) yoki "KIRIM" (bazaga salyarka keldi/olindi).
+Misol: "Ekskavator 871 ga 100 litr salyarka — Javohir" → fuel_tech="Ekskavator 871", fuel_driver="Javohir", fuel_liters=100, fuel_type="CHIQIM", amount=0 (narx aytilmagan).
+Agar narxi ham aytilsa ("100 litr 13 mingdan") — odatdagidek qty/unit_price/amount ni ham to'ldir.
+
+SON O'QISH: "200ming"=200000, "2 mln"=2000000, "20k"=20000, "2,5 mln"=2500000. "besh yuz ming"=500000.
+TIL: o'zbek (lotin/kirill), rus, ingliz. Imlo xatolari va qisqartmalarni o'zing tushun va to'g'rila.
+Bitta xabarda bir nechta yozuv bo'lsa — har birini alohida item qil.
+Umuman tushunmasang ham bitta expense qaytar: name = matnning o'zi, amount = topilgan son yoki 0.
 
 Faqat JSON:
 {"items":[
-  {"kind":"zayavka","z_kind":"material|work","master_id":null,"master_name":null,"off_plan":false,"name":"...","qty":0,"unit":"...","unit_price":0,"notes":null},
-  {"kind":"material","master_id":null,"master_name":null,"off_plan":false,"name":"...","qty":0,"unit":"...","unit_price":0,"supplier":null},
-  {"kind":"expense","category":"${catList}","amount":0,"payment_method":"Naqd|Plastik|O'tkazma|Hisob","description":"...","paid_by":null},
-  {"kind":"income","amount":0,"payment_method":"Naqd|Bank","description":"...","payer":null}
+  {"kind":"expense","name":"...","qty":1,"unit":"dona","unit_price":0,"amount":0,"category":"Boshqa","payment_method":"Naqd","description":"...","paid_by":null,"fuel_tech":null,"fuel_driver":null,"fuel_liters":null,"fuel_type":null},
+  {"kind":"income","amount":0,"payment_method":"Naqd","description":"...","payer":null}
 ]}`;
+
 }
+
+/** AI javobini bitta qat'iy shaklga keltiradi: faqat expense/income, son-birlik-summa mos. */
+function normalizeItems(items: any[]): any[] {
+  const out: any[] = [];
+  for (const raw of items ?? []) {
+    const it: any = { ...raw };
+    if (it.kind === "income") {
+      out.push({
+        kind: "income",
+        amount: Number(it.amount) || 0,
+        payment_method: payMethod(`${it.payment_method ?? ""} ${it.description ?? ""}`),
+        description: it.description ?? it.name ?? "Kirim",
+        payer: it.payer ?? it.paid_by ?? null,
+      });
+      continue;
+    }
+    // Qolgan hamma narsa — xarajat
+    const name = String(it.name ?? it.description ?? "Xarajat").trim() || "Xarajat";
+    let qty = Number(it.qty);
+    if (!Number.isFinite(qty) || qty <= 0) qty = 1;
+    let unit = String(it.unit ?? "").trim() || "dona";
+    let price = Number(it.unit_price) || 0;
+    let amount = Number(it.amount) || 0;
+    if (amount > 0 && price > 0) {
+      // Nomuvofiqlik bo'lsa umumiy summa ustun
+      if (Math.abs(qty * price - amount) > Math.max(1, amount * 0.02)) price = amount / qty;
+    } else if (amount > 0 && price <= 0) {
+      price = amount / qty;
+    } else if (price > 0 && amount <= 0) {
+      amount = qty * price;
+    }
+    const liters = Number(it.fuel_liters);
+    out.push({
+      kind: "expense",
+      name,
+      qty,
+      unit,
+      unit_price: Math.round(price),
+      amount: Math.round(amount),
+      category: normalizeSheetCategory(it.category, `${name} ${it.description ?? ""}`),
+      payment_method: payMethod(`${it.payment_method ?? ""} ${it.description ?? ""}`),
+      description: it.description ?? name,
+      paid_by: it.paid_by ?? it.who ?? null,
+      fuel_tech: it.fuel_tech ?? null,
+      fuel_driver: it.fuel_driver ?? null,
+      fuel_liters: Number.isFinite(liters) && liters > 0 ? liters : null,
+      fuel_type: String(it.fuel_type ?? "").toUpperCase() === "KIRIM" ? "KIRIM" : "CHIQIM",
+    });
+
+  }
+  return out;
+}
+
 
 // ---------- Render ----------
 function fmtMoney(n: any) {
   const v = Number(n);
   return Number.isFinite(v) ? v.toLocaleString("uz-UZ") : "—";
 }
-function parseMoney(text: string): number {
-  const m = text.toLowerCase().match(/(\d[\d\s.,'`]*\d|\d)\s*(mlrd|milliard|миллиард|billion|bln|mln|million|млн|ming|минг|k|000)?/i);
-  if (!m) return 0;
-  let numStr = m[1].replace(/[\s'`]/g, "");
+function parseMoneyNum(raw: string): number {
+  let numStr = raw.replace(/[\s'`]/g, "");
   const hasComma = numStr.includes(",");
   const hasDot = numStr.includes(".");
   if (hasComma && hasDot) {
     const lastComma = numStr.lastIndexOf(",");
     const lastDot = numStr.lastIndexOf(".");
-    numStr = lastComma > lastDot
-      ? numStr.replace(/\./g, "").replace(",", ".")
-      : numStr.replace(/,/g, "");
+    numStr = lastComma > lastDot ? numStr.replace(/\./g, "").replace(",", ".") : numStr.replace(/,/g, "");
   } else if (hasComma) {
     const parts = numStr.split(",");
-    numStr = parts.length > 2 || (parts.length === 2 && parts[1].length === 3)
-      ? numStr.replace(/,/g, "")
-      : numStr.replace(",", ".");
+    numStr = parts.length > 2 || (parts.length === 2 && parts[1]!.length === 3) ? numStr.replace(/,/g, "") : numStr.replace(",", ".");
   } else if (hasDot) {
     const parts = numStr.split(".");
-    if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3)) {
-      numStr = numStr.replace(/\./g, "");
-    }
+    if (parts.length > 2 || (parts.length === 2 && parts[1]!.length === 3)) numStr = numStr.replace(/\./g, "");
   }
   const n = Number(numStr);
-  if (!Number.isFinite(n)) return 0;
-  const unit = (m[2] ?? "").toLowerCase();
-  if (["mlrd", "milliard", "миллиард", "billion", "bln"].includes(unit)) return n * 1_000_000_000;
-  if (["mln", "million", "млн"].includes(unit)) return n * 1_000_000;
-  if (["ming", "минг", "k"].includes(unit)) return n * 1_000;
-  return n;
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Matndagi pul summasini o'qiydi. Bir xil deb qabul qilinadi:
+ * «130 m», «130m», «130 ming», «130 k», «130 sum/so'm», «130,000», «130 000», «130000» → 130 000.
+ * Kichik son (<1000) yonida «sum/so'm» bo'lsa — ming deb olinadi (amalda 130 so'mlik xarajat yo'q).
+ * Bir nechta son bo'lsa (masalan «10 qop 65 ming») — pul belgisi bor sonni afzal ko'radi.
+ */
+function parseMoney(text: string): number {
+  const low = text.toLowerCase().replace(/[’‘ʼʻ`]/g, "'");
+  const re = /(?<![a-zа-я\d.,])(\d[\d\s.,']*\d|\d)\s*(mlrd|milliard|миллиард|billion|bln|mln|million|млн|миллион|ming|минг|тыс|k(?![a-zа-я])|m(?![a-zа-я²³0-9])|so'?m|sum|сум|сўм)?/gi;
+  let best = 0, bestScore = -1;
+  for (const m of low.matchAll(re)) {
+    const n = parseMoneyNum(m[1]!.trim());
+    if (!n) continue;
+    const unit = (m[2] ?? "").toLowerCase();
+    let v = n, score = 0;
+    if (/^(mlrd|milliard|миллиард|billion|bln)$/.test(unit)) { v = n * 1e9; score = 3; }
+    else if (/^(mln|million|млн|миллион)$/.test(unit)) { v = n * 1e6; score = 3; }
+    else if (/^(ming|минг|тыс|k|m)$/.test(unit)) { v = n * 1e3; score = 3; }
+    else if (unit) { v = n < 1000 ? n * 1e3 : n; score = 3; } // sum / so'm
+    else if (n >= 1000) score = 2; // 130000, 130,000, 130 000
+    else score = 0; // yalang kichik son — ehtimol soni (10 qop)
+    if (score > bestScore || (score === bestScore && v > best)) { best = v; bestScore = score; }
+  }
+  return best;
 }
 function isIncomeText(text: string) {
   return /\b(kirim|prixod|prexod|приход|pul\s*old|пул\s*олд|pul\s*keldi|kassaga|to'?lov\s*keldi|investitsiya|avans\s*old|mijoz\s*to'?la)/i.test(text);
@@ -462,30 +956,29 @@ function isIncomeText(text: string) {
 function payMethod(text: string) {
   return /\b(bank|plastik|karta|o'?tkazma|hisob|перевод|карта)/i.test(text) ? "Bank" : "Naqd";
 }
-const KIND_BADGE: Record<string, string> = {
-  zayavka: "📝 Zayavka",
-  material: "📦 Ombor",
-  expense: "💰 Xarajat",
-  income: "🟢 Kirim",
-};
 function renderItem(it: any, idx: number): string {
   const kind = it.kind ?? "expense";
-  const badge = `<b>${idx}.</b> ${KIND_BADGE[kind] ?? kind}`;
-  if (kind === "material") {
-    const total = (Number(it.qty) || 0) * (Number(it.unit_price) || 0);
-    return `${badge} — ${it.name ?? "?"} ${it.qty ?? "?"} ${it.unit ?? ""} × ${fmtMoney(it.unit_price)} = <b>${fmtMoney(total)}</b>`;
-  }
-  if (kind === "zayavka") {
-    const zk = it.z_kind === "work" ? "🔨" : "📦";
-    return `${badge} ${zk} ${it.name ?? "?"} — ${it.qty ?? "?"} ${it.unit ?? ""}`;
-  }
   if (kind === "income") {
     const amount = Math.max(Number(it.amount) || 0, parseMoney(`${it.description ?? ""} ${it._source_note ?? ""}`));
-    return `${badge} — ${fmtMoney(amount)} so'm (${it.payment_method ?? "Naqd"})${it.description ? ` — ${it.description}` : ""}`;
+    return `<b>${idx}. Kirim</b> — ${fmtMoney(amount)} so'm (${it.payment_method ?? "Naqd"})${it.description ? ` · ${it.description}` : ""}`;
   }
-  return `${badge} — ${it.category ?? "?"}: ${fmtMoney(it.amount)} so'm${it.description ? ` (${it.description})` : ""}`;
+  const qty = Number(it.qty) || 1;
+  const price = Number(it.unit_price) || 0;
+  const amount = Number(it.amount) || qty * price;
+  const name = it.name ?? it.description ?? "Xarajat";
+  const detail = price > 0 && qty > 0 ? `${qty} ${it.unit ?? "dona"} × ${fmtMoney(price)} = ` : "";
+  const cat = it.category ? ` [${it.category}]` : "";
+  const liters = Number(it.fuel_liters) || 0;
+  if (liters > 0) {
+    const tech = it.fuel_tech ? ` · ${it.fuel_tech}` : "";
+    const drv = it.fuel_driver ? ` · ${it.fuel_driver}` : "";
+    const money = amount > 0 ? ` — <b>${fmtMoney(amount)}</b> so'm` : " (faqat litr)";
+    return `<b>${idx}. ⛽ ${name}</b> — ${liters} l${tech}${drv}${money}`;
+  }
+  return `<b>${idx}. ${name}</b> — ${detail}<b>${fmtMoney(amount)}</b> so'm${cat}`;
+
 }
-const renderItems = (items: any[]) => items.map((it, i) => renderItem(it, i + 1)).join("\n");
+
 
 // ---------- Saqlash ----------
 async function persistDraft(session: Session): Promise<string> {
@@ -496,6 +989,13 @@ async function persistDraft(session: Session): Promise<string> {
   const sb = admin();
   let ok = 0;
   const errs: string[] = [];
+  const fuelEntries: Array<{ date: string; type: string; tech: string | null; driver: string | null; liters: number; note: string }> = [];
+
+
+  // Tasdiqlash tugmasi 2 marta bosilsa yoki Telegram so'rovni qayta yuborsa —
+  // draftni darhol tozalab qo'yamiz, shunda ikkinchi chaqiruv bo'sh draftni ko'radi.
+  session.data = { ...session.data, draft: [] };
+  await saveSession(session);
 
   const nullIfBad = (v: any) => {
     if (v == null) return null;
@@ -641,7 +1141,7 @@ async function persistDraft(session: Session): Promise<string> {
       const _isContract = /shartnom|kontrak|contract/.test(_t);
       ({ error: err } = await sb.from("incomes").insert({
         project_id,
-        category: _isContract ? "Shartnoma" : "Kirim",
+        category: _isContract ? "Shartnoma" : payMethod(`${it.payment_method ?? ""} ${it.description ?? ""} ${it._source_note ?? ""}`),
         description: it.description ?? null,
         amount,
         payment_method: payMethod(`${it.payment_method ?? ""} ${it.description ?? ""} ${it._source_note ?? ""}`),
@@ -651,25 +1151,54 @@ async function persistDraft(session: Session): Promise<string> {
         source_note: srcNote,
       }));
     } else {
+      const qty = Number(it.qty) > 0 ? Number(it.qty) : 1;
+      let amount = Number(it.amount) || 0;
+      let price = Number(it.unit_price) || 0;
+      if (!amount && price) amount = qty * price;
+      if (!price && amount) price = amount / qty;
+      const name = it.name ?? it.description ?? null;
+      const liters = Number(it.fuel_liters) || 0;
+      if (liters > 0) {
+        fuelEntries.push({
+          date: new Date().toISOString(),
+          type: it.fuel_type === "KIRIM" ? "KIRIM" : "CHIQIM",
+          tech: it.fuel_tech ?? null,
+          driver: it.fuel_driver ?? it.paid_by ?? null,
+          liters,
+          note: amount > 0 ? `${name ?? "Salyarka"} — ${Math.round(amount).toLocaleString("uz-UZ")} so'm` : (name ?? ""),
+        });
+      }
+      // Narx aytilmagan yoqilg'i yozuvi — faqat Salyarka jadvaliga, kassaga tegmaydi
+      if (liters > 0 && amount <= 0) { ok++; continue; }
       ({ error: err } = await sb.from("expenses").insert({
         project_id,
-        category: it.category ?? "Boshqa",
-        description: it.description ?? null,
-        amount: Number(it.amount) || 0,
-        payment_method: it.payment_method ?? "Naqd",
-        paid_by: it.paid_by ?? null,
+        category: normalizeSheetCategory(it.category, `${name ?? ""} ${it._source_note ?? ""}`),
+        description: name,
+        amount: Math.round(amount),
+        qty,
+        unit: it.unit ?? "dona",
+        unit_price: Math.round(price),
+        payment_method: it.payment_method === "Bank" || it.payment_method === "Karta" ? it.payment_method : "Naqd",
+        // Transfer: paid_by = oluvchi. Oddiy xarajat: kim yozgan bo'lsa o'sha (@username).
+        paid_by: it.paid_by ?? it._author ?? tgAuthorTag(session.username),
         telegram_user_id: session.telegram_user_id,
         source: src,
         source_note: srcNote,
       }));
     }
+
     if (err) errs.push(err.message);
     else ok++;
   }
-  // Clear draft
-  session.data = { ...session.data, draft: [] };
-  await saveSession(session);
-  return `✅ <b>${ok}</b> ta yozuv Umumiy jadvalga saqlandi${errs.length ? `\n⚠️ Xato: ${errs.length} (${errs[0]})` : ""}`;
+  let fuelNote = "";
+  if (fuelEntries.length) {
+    const r = await appendFuelEntries(fuelEntries);
+    fuelNote = r.error
+      ? `\n⚠️ Salyarka jadvaliga yozilmadi: ${r.error.slice(0, 120)}`
+      : `\n⛽ Salyarka jadvaliga ${r.appended} ta yozuv qo'shildi`;
+  }
+  return `✅ <b>${ok}</b> ta yozuv Umumiy jadvalga saqlandi${fuelNote}${errs.length ? `\n⚠️ Xato: ${errs.length} (${errs[0]})` : ""}`;
+
 }
 
 // ---------- Loyiha tanlash ----------
@@ -678,30 +1207,39 @@ async function showFirmPicker(chat_id: number) {
   await showProjectPicker(chat_id, null);
 }
 
-async function showProjectPicker(chat_id: number, firm_id: string | null) {
-  let q = admin().from("projects").select("id,name,code,firm_id").eq("status", "active");
-  if (firm_id) q = q.eq("firm_id", firm_id);
-  const { data } = await q.order("created_at", { ascending: false }).limit(30);
-  const projects = data ?? [];
-  if (!projects.length) {
-    await send(chat_id, "❌ Faol loyiha yo'q.", mainMenu(0, chat_id));
+/** Foydalanuvchiga biriktirilgan loyihani sessiyaga bog'laydi (tanlov tugmasi yo'q). */
+async function bindAssignedProject(session: Session): Promise<boolean> {
+  const sb = admin();
+  const { data: prof } = await sb
+    .from("profiles").select("id").eq("telegram_user_id", session.telegram_user_id).maybeSingle();
+  if (!prof) return false;
+  const { data: acc } = await sb
+    .from("user_project_access").select("project_id").eq("user_id", (prof as any).id);
+  const ids = (acc ?? []).map((r: any) => r.project_id);
+  if (!ids.length) return false;
+  const { data: projs } = await sb
+    .from("projects").select("id,name").in("id", ids).eq("status", "active").order("name");
+  const list = (projs ?? []) as Array<{ id: string; name: string }>;
+  if (!list.length) return false;
+  const cur = list.find((p) => p.id === session.data?.project_id) ?? list[0];
+  session.data = { ...(session.data ?? {}), project_id: cur.id, project_name: cur.name };
+  projectNameByChat.set(session.chat_id, cur.name);
+  await saveSession(session);
+  return true;
+}
+
+async function showProjectPicker(chat_id: number, _firm_id: string | null) {
+  const s = await getSession(chat_id, 0, null);
+  const ok = await bindAssignedProject(s);
+  if (!ok) {
+    await send(
+      chat_id,
+      "❌ Sizga loyiha biriktirilmagan.\nAdministrator sizni loyihaga biriktirgach ishlashingiz mumkin.",
+      mainMenu(getDraft(s).length, chat_id),
+    );
     return;
   }
-  // Reply keyboard sifatida — pastdagi menyu o'rniga loyihalar ro'yxati chiqadi
-  const map = new Map<string, string>();
-  const rows: { text: string }[][] = [];
-  for (const p of projects as any[]) {
-    const label = `🏗 ${p.name}${p.code ? ` (${p.code})` : ""}`;
-    map.set(label, p.id);
-    rows.push([{ text: label }]);
-  }
-  rows.push([{ text: "↩️ Bekor" }]);
-  projectPickByChat.set(chat_id, map);
-  // Sessiyaga flag yozish — text handlerda ushlash uchun
-  const s = await getSession(chat_id, 0, null);
-  s.flow = "pick_project";
-  await saveSession(s);
-  await send(chat_id, "🏗 <b>Loyihani tanlang:</b>", { keyboard: rows, resize_keyboard: true });
+  await send(chat_id, `🏗 Loyiha: <b>${s.data.project_name}</b>`, mainMenu(getDraft(s).length, chat_id));
 }
 
 
@@ -813,14 +1351,11 @@ async function showSmetaPicker(chat_id: number, scope: "material" | "work" | "of
 
 // ---------- AI qayta ishlash ----------
 async function getPrompt() {
-  const sb = admin();
-  const [mats, works, catsRes] = await Promise.all([
+  const [mats, works] = await Promise.all([
     loadMaster("material"),
     loadMaster("work"),
-    sb.from("expense_categories").select("name").order("name"),
   ]);
-  const cats = (catsRes.data ?? []).map((c: any) => c.name).filter(Boolean);
-  return autoPrompt(mats, works, cats);
+  return autoPrompt(mats, works, [...SHEET_EXPENSE_CATEGORIES]);
 }
 
 async function aiParse(text: string | null, imageUrl: string | null): Promise<any[]> {
@@ -832,7 +1367,7 @@ async function aiParse(text: string | null, imageUrl: string | null): Promise<an
   } else {
     parts.push({ type: "text", text: text || "" });
   }
-  const parsed = await callAi(prompt, parts, imageUrl ? "google/gemini-2.5-pro" : "google/gemini-2.5-flash");
+  const parsed = await callAi(prompt, parts, imageUrl ? "google/gemini-2.5-flash" : "google/gemini-2.5-flash");
   let items = Array.isArray(parsed?.items) ? parsed.items : [];
   const sourceText = text ?? "";
   // KIRIM override: agar matnda kirim/prixod/pul oldim... bo'lsa — XARAJAT EMAS, KIRIM sifatida saqlaymiz.
@@ -847,13 +1382,28 @@ async function aiParse(text: string | null, imageUrl: string | null): Promise<an
       payer: items[0]?.payer ?? items[0]?.who ?? null,
     }];
   }
+  items = normalizeItems(items);
+  // Summa tekshiruvi: matndagi sonni o'zimiz o'qiymiz ("102 ming" = "102,000" = 102000).
+  // AI summa topmasa yoki "ming/mln" ni hisobga olmagan bo'lsa (102 ming → 102 deb o'qisa) — tuzatamiz.
+  if (items.length === 1 && items[0].kind === "expense" && sourceText) {
+    const amt = parseMoney(sourceText);
+    if (amt > 0) {
+      const aiAmt = Number(items[0].amount) || 0;
+      const unitMismatch = aiAmt > 0 && aiAmt < amt && ((amt % aiAmt === 0 && amt / aiAmt >= 1000) || (aiAmt < 1000 && amt >= 1000));
+      if (aiAmt <= 0 || unitMismatch) {
+        items[0].amount = amt;
+        items[0].unit_price = Math.round(amt / (items[0].qty || 1));
+      }
+    }
+  }
   return items;
 }
 
 
 async function addToDraft(session: Session, newItems: any[], sourceMeta: { source: string; note: string }) {
   if (!newItems.length) {
-    await send(session.chat_id, "⚠️ Tushuna olmadim. Aniqroq yozing.", mainMenu(getDraft(session).length, session.chat_id));
+    const err = lastAiError ? `\n\n⚠️ ${lastAiError}` : "";
+    await send(session.chat_id, `⚠️ Tushuna olmadim. Aniqroq yozing.${err}`, mainMenu(getDraft(session).length, session.chat_id));
     return;
   }
   const tagged = newItems.map((it) => ({ ...it, _source: sourceMeta.source, _source_note: sourceMeta.note }));
@@ -869,54 +1419,152 @@ async function addToDraft(session: Session, newItems: any[], sourceMeta: { sourc
     session.data = { ...session.data, draft, edit_index: null };
   } else {
     draft = [...draft, ...tagged];
-    confirmMsg = `✅ Qo'shildi (${draft.length})`;
+    confirmMsg = `Qo'shildi:\n${tagged.map((it, i) => renderItem(it, draft.length - tagged.length + i + 1)).join("\n")}`;
     session.data = { ...session.data, draft };
   }
   await saveSession(session);
   await send(session.chat_id, confirmMsg, mainMenu(draft.length, session.chat_id));
 }
 
+/**
+ * Guruhlarda yig'ilgan yozuvlarni botning shaxsiy daftariga ko'chiradi.
+ * Guruhda faqat «✅ Qabul qilindi» yoziladi, tasdiqlash shaxsiy chatda bo'ladi.
+ */
+async function mergeGroupDrafts(session: Session): Promise<number> {
+  if (isGroupChat(session.chat_id)) return 0;
+  const { data } = await admin()
+    .from("telegram_sessions")
+    .select("chat_id,data")
+    .lt("chat_id", 0);
+  const rows = (data ?? []) as Array<{ chat_id: number; data: any }>;
+  const incoming: any[] = [];
+  const clearIds: number[] = [];
+  for (const r of rows) {
+    const items = Array.isArray(r.data?.draft) ? r.data.draft : [];
+    if (!items.length) continue;
+    incoming.push(...items);
+    clearIds.push(r.chat_id);
+  }
+  if (!incoming.length) return 0;
+  // Guruh navbatini darhol bo'shatamiz — ikki marta ko'chirilmasligi uchun.
+  for (const id of clearIds) {
+    const row = rows.find((x) => x.chat_id === id);
+    await admin()
+      .from("telegram_sessions")
+      .update({ data: { ...(row?.data ?? {}), draft: [] }, updated_at: new Date().toISOString() })
+      .eq("chat_id", id);
+  }
+  session.data = { ...(session.data ?? {}), draft: [...getDraft(session), ...incoming] };
+  await saveSession(session);
+  return incoming.length;
+}
+
 async function showDaftar(session: Session, replaceMessageId?: number, mode: "view" | "edit" | "del" = "view") {
+  if (mode === "view") await mergeGroupDrafts(session);
   const draft = getDraft(session);
   const chat_id = session.chat_id;
   if (!draft.length) {
-    const text = "📒 <b>Daftar bo'sh.</b>\nXarajat/material yozing yoki ovoz/rasm yuboring.";
+    const text = "<b>Daftar bo'sh.</b>\nXarajatni yozing yoki ovoz/rasm yuboring.";
     if (replaceMessageId) await editText(chat_id, replaceMessageId, text);
     else await send(chat_id, text, mainMenu(0, chat_id));
     return;
   }
   const lines = draft.map((it, i) => renderItem(it, i + 1));
+  const total = draft.reduce((s, it) => s + (it.kind === "income" ? 0 : Number(it.amount) || 0), 0);
   const buttons: any[] = [];
   if (mode === "view") {
     buttons.push([
-      { text: "✏️ Tahrirlash", callback_data: "daftar:pick:edit" },
-      { text: "🗑 O'chirish", callback_data: "daftar:pick:del" },
+      { text: "✅ Tasdiqlash", callback_data: "draft:confirm" },
+      { text: "❌ Bekor qilish", callback_data: "draft:clear" },
     ]);
     buttons.push([
-      { text: "✅ Hammasini tasdiqlash", callback_data: "draft:confirm" },
-      { text: "🗑 Tozalash", callback_data: "draft:clear" },
+      { text: "Tahrirlash", callback_data: "daftar:pick:edit" },
+      { text: "O'chirish", callback_data: "daftar:pick:del" },
     ]);
   } else {
     // Pick a row: show 1..N as a grid (max 4 per row)
     const cb = mode === "edit" ? "item:edit:" : "item:del:";
     let row: any[] = [];
     for (let i = 0; i < draft.length; i++) {
-      row.push({ text: `${mode === "edit" ? "✏️" : "🗑"} ${i + 1}`, callback_data: `${cb}${i}` });
+      row.push({ text: `${i + 1}`, callback_data: `${cb}${i}` });
       if (row.length === 4) { buttons.push(row); row = []; }
     }
     if (row.length) buttons.push(row);
     buttons.push([{ text: "↩️ Orqaga", callback_data: "daftar:view" }]);
   }
   const hint = mode === "view"
-    ? "<i>Tahrirlash yoki o'chirish uchun tugmani bosing.</i>"
+    ? `<b>Jami: ${fmtMoney(total)} so'm</b>`
     : mode === "edit"
       ? "<i>Tahrirlanadigan yozuv raqamini tanlang.</i>"
       : "<i>O'chiriladigan yozuv raqamini tanlang.</i>";
-  const body = `📒 <b>Daftar (${draft.length} ta yozuv):</b>\n\n${lines.join("\n")}\n\n${hint}`;
+  const body = `<b>Daftar — ${draft.length} ta yozuv</b>\n\n${lines.join("\n")}\n\n${hint}`;
   if (replaceMessageId) await editText(chat_id, replaceMessageId, body, { inline_keyboard: buttons });
   else await send(chat_id, body, { inline_keyboard: buttons });
 }
 const showDraft = showDaftar;
+
+/**
+ * Daftarni buyruq bilan tahrirlash (matn yoki ovoz):
+ * "3-qatorni o'chir", "2-yozuv summasi 150 ming", "1 qatorda 10 qop emas 12 qop".
+ * true qaytarsa — buyruq bajarildi.
+ */
+function isEditIntent(t: string): boolean {
+  return /o['‘’`]?chir|tahrir|o['‘’`]?zgartir|o['‘’`]?zgart|almashtir|to['‘’`]?g['‘’`]?rila|tuzat|emas|bo['‘’`]?lsin|удал|измен|исправ|замен/.test(t);
+}
+
+async function tryDaftarCommand(session: Session, text: string): Promise<boolean> {
+  const draft = getDraft(session);
+  if (!draft.length || !text) return false;
+  const t = text.toLocaleLowerCase("uz");
+  // Tahrir niyati bo'lsa yetarli — qator raqami shart emas.
+  // "30 mingni 350 ming ozgartir", "benzinni 350 ming qil", "oxirgisini o'chir".
+  if (!isEditIntent(t)) return false;
+
+  const list = draft.map((it, i) => ({ n: i + 1, kind: it.kind ?? "expense", name: it.name ?? it.description, qty: it.qty, unit: it.unit, unit_price: it.unit_price, amount: it.amount, category: it.category, payment_method: it.payment_method }));
+  const res = await callAi(
+    `Sen daftar tahrirlovchisan. Foydalanuvchi daftardagi yozuvni tahrirlash yoki o'chirishni so'raydi.
+Daftar (n — qator raqami): ${JSON.stringify(list)}
+Ruxsat etilgan kategoriyalar: ${SHEET_EXPENSE_CATEGORIES.join(" | ")}
+QATORNI ANIQLASH: foydalanuvchi qator raqamini aytmasligi mumkin. U holda qatorni shu belgilardan top:
+- eski summa yoki narx bo'yicha ("30 mingni 350 ming qil" → amount yoki unit_price = 30000 bo'lgan qator),
+- nomi bo'yicha ("benzinni 350 ming qil" → name ichida "benzin" bor qator),
+- "oxirgisi"/"oxirgi yozuv" → eng katta n, "birinchisi" → n=1,
+- daftarda faqat bitta qator bo'lsa — o'sha qator.
+Bir nechta qator mos kelsa, eng oxirgisini (katta n) tanla. Hech biri mos kelmasa — bo'sh actions qaytar.
+Qoidalar: faqat so'ralgan maydonlarni o'zgartir. Son o'zgarsa va dona narxi ma'lum bo'lsa amount = qty*unit_price qayta hisobla; faqat summa o'zgarsa unit_price = amount/qty. "200ming"=200000, "2 mln"=2000000.
+Faqat JSON: {"actions":[{"action":"delete"|"edit","n":1,"changes":{"name"?:"","qty"?:0,"unit"?:"","unit_price"?:0,"amount"?:0,"category"?:"","payment_method"?:"Naqd"|"Bank","kind"?:"expense"|"income"}}]}
+Agar bu tahrir buyrug'i bo'lmasa: {"actions":[]}`,
+    [{ type: "text", text }],
+  );
+  const actions: any[] = Array.isArray(res?.actions) ? res.actions : [];
+  if (!actions.length) return false;
+
+  const next = [...draft];
+  const done: string[] = [];
+  const dels = new Set<number>();
+  for (const a of actions) {
+    const idx = Number(a?.n) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= draft.length) continue;
+    if (a.action === "delete") { dels.add(idx); done.push(`#${idx + 1} o'chirildi`); continue; }
+    if (a.action === "edit" && a.changes && typeof a.changes === "object") {
+      const merged = { ...next[idx], ...a.changes };
+      if (a.changes.name) merged.description = a.changes.name;
+      if (a.changes.qty != null && a.changes.amount == null && Number(merged.unit_price) > 0) merged.amount = Number(merged.qty) * Number(merged.unit_price);
+      if (a.changes.amount != null && a.changes.unit_price == null) merged.unit_price = 0;
+      const [norm] = normalizeItems([merged]);
+      next[idx] = { ...next[idx], ...norm, _source: next[idx]._source, _source_note: next[idx]._source_note };
+      done.push(`#${idx + 1} tahrirlandi`);
+    }
+  }
+  if (!done.length) return false;
+  const finalDraft = next.filter((_, i) => !dels.has(i));
+  session.flow = null;
+  session.data = { ...session.data, draft: finalDraft, edit_index: null };
+  await saveSession(session);
+  await send(session.chat_id, `✏️ ${done.join(", ")}.`, mainMenu(finalDraft.length, session.chat_id));
+  await showDaftar(session);
+  return true;
+}
 
 // ============================================================
 // 💼 BUXGALTERIYA — Zayavka button-flow
@@ -933,13 +1581,15 @@ function dateLabel(d: string) {
   return d;
 }
 
-function bzGetState(s: Session) {
-  const st = s.data?.bz ?? { step: null, project_id: null, project_name: null, date: null, items: [], cur: {} };
-  return st;
+function getFlowState<T = any>(s: Session, key: string, fallback: T): T {
+  return s.data?.[key] ?? fallback;
 }
-function bzSetState(s: Session, st: any) {
-  s.data = { ...(s.data ?? {}), bz: st };
+function setFlowState<T>(s: Session, key: string, st: T) {
+  s.data = { ...(s.data ?? {}), [key]: st };
 }
+const bzGetState = (s: Session) =>
+  getFlowState(s, "bz", { step: null, project_id: null, project_name: null, date: null, items: [], cur: {} } as any);
+const bzSetState = (s: Session, st: any) => setFlowState(s, "bz", st);
 
 async function bzShowProjects(chat_id: number) {
   const { data } = await admin().from("projects").select("id,name,code").eq("status", "active").order("name").limit(40);
@@ -1176,10 +1826,9 @@ async function bzPersist(session: Session) {
 // ============================================================
 type ShState = { step: string; supplier: string | null; contract_no: string | null; contract_date: string | null; amount: number | null; note: string | null; file_url: string | null };
 
-function shGet(s: Session): ShState {
-  return s.data?.sh ?? { step: "supplier", supplier: null, contract_no: null, contract_date: null, amount: null, note: null, file_url: null };
-}
-function shSet(s: Session, st: ShState) { s.data = { ...(s.data ?? {}), sh: st }; }
+const shGet = (s: Session): ShState =>
+  getFlowState<ShState>(s, "sh", { step: "supplier", supplier: null, contract_no: null, contract_date: null, amount: null, note: null, file_url: null });
+const shSet = (s: Session, st: ShState) => setFlowState(s, "sh", st);
 
 async function shStart(session: Session) {
   shSet(session, { step: "supplier", supplier: null, contract_no: null, contract_date: null, amount: null, note: null, file_url: null });
@@ -1283,12 +1932,9 @@ async function shHandle(session: Session, msg: any, text: string) {
 // ============================================================
 const NK_UNITS = ["dona", "m", "m²", "kg", "qop"];
 
-function nkGetState(s: Session) {
-  return s.data?.nk ?? { step: null, project_id: null, project_name: null, date: null, supplier: null, nakladnoy_no: null, photo_url: null, photo_mime: null, items: [], cur: {} };
-}
-function nkSetState(s: Session, st: any) {
-  s.data = { ...(s.data ?? {}), nk: st };
-}
+const nkGetState = (s: Session) =>
+  getFlowState(s, "nk", { step: null, project_id: null, project_name: null, date: null, supplier: null, nakladnoy_no: null, photo_url: null, photo_mime: null, items: [], cur: {} } as any);
+const nkSetState = (s: Session, st: any) => setFlowState(s, "nk", st);
 
 async function nkShowProjects(chat_id: number) {
   const { data } = await admin().from("projects").select("id,name,code").eq("status", "active").order("name").limit(40);
@@ -1329,9 +1975,6 @@ Faqat JSON.`;
   };
 }
 
-async function aiParseNakladnoyItems(text: string): Promise<any[]> {
-  return (await aiParseNakladnoy(text)).items;
-}
 
 async function nkAskInput(session: Session) {
   const st = nkGetState(session);
@@ -1468,7 +2111,7 @@ async function nkPersist(session: Session) {
       const r = await fetch(st.photo_url);
       photoBytes = new Uint8Array(await r.arrayBuffer());
       photoMime = photoMime ?? r.headers.get("content-type");
-    } catch {}
+    } catch (e) { console.error("[tg] nakladnoy photo fetch failed", e); }
   }
 
   const company = (await bzGetSetting("company_name")) ?? 'FORTIGEN MCHJ';
@@ -1490,7 +2133,7 @@ async function nkPersist(session: Session) {
   try {
     await sb.storage.from("nakladnoy").upload(pdfKey, pdfBytes, { contentType: "application/pdf" });
     pdfUrl = sb.storage.from("nakladnoy").getPublicUrl(pdfKey).data.publicUrl;
-  } catch {}
+  } catch (e) { console.error("[tg] nakladnoy pdf upload failed", e); }
 
   const groupId = crypto.randomUUID();
   const rows = (st.items as any[]).map((it) => ({
@@ -1705,13 +2348,328 @@ async function linkProfileByContact(chat_id: number, uid: number, username: stri
     .from("profiles")
     .update({ telegram_user_id: uid, telegram_username: username })
     .eq("id", prof.id);
+  buttonAccessByChat.set(chat_id, await loadButtonAccess(chat_id, uid));
   await getSession(chat_id, uid, username);
   await send(chat_id, `✅ <b>Profil ulandi</b>\n👤 ${prof.full_name ?? "—"}`, mainMenu(0, chat_id));
   await showFirmPicker(chat_id);
   return true;
 }
 
+// ---------- AI chat oqimi (CEO va boshqa ruxsatli rollar uchun) ----------
+async function runAiChat(session: any, msg: any, text: string, ceoOnly: boolean) {
+  const chat_id: number = session.chat_id;
+  if (aiAllowedByChat.get(chat_id) !== true) {
+    session.flow = null;
+    await saveSession(session);
+    await send(chat_id, "⛔ AI yordamchiga ruxsat yo'q.", mainMenu(getDraft(session).length, chat_id));
+    return;
+  }
+  const menu = () => (ceoOnly ? { remove_keyboard: true } : chatMenu());
+
+  if (!ceoOnly && (text === "⬅️ Orqaga" || text === "🚪 Chatdan chiqish" || text === "/chiqish" || text === "🧹 Suhbatni tozalash")) {
+    session.flow = null;
+    session.data = { ...session.data, chat_history: [] };
+    await saveSession(session);
+    await send(chat_id, "⬅️ Asosiy menyuga qaytdingiz.", mainMenu(getDraft(session).length, chat_id));
+    return;
+  }
+
+  // Ovoz → transkripsiya → savol
+  let question = text;
+  const isVoiceInput = !text && !!(msg.voice || msg.audio);
+  if (!question && (msg.voice || msg.audio)) {
+    const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
+    const f = await uploadFile(fileId, `voice/chat`);
+    if (f) {
+      await send(chat_id, "🎧 Ovoz tinglanmoqda...");
+      question = (await transcribeAudio(f.bytes, f.mime)) ?? "";
+    }
+  }
+  if (!question) {
+    await send(chat_id, "📝 Savolni matn yoki ovoz orqali yuboring.", menu());
+    return;
+  }
+
+  // «excel qilib ber» → Sheet'ning oxirgi holati .xlsx
+  const excelKind = detectExcelRequest(question);
+  if (excelKind) {
+    await tg("sendChatAction", { chat_id, action: "upload_document" });
+    const x = await buildSheetExcel(excelKind).catch((e) => { console.error("excel", e); return null; });
+    if (!x) { await send(chat_id, "⚠️ Jadvalni o'qib bo'lmadi, Excel tayyorlanmadi. Birozdan keyin qayta so'rang.", menu()); return; }
+    const fd = new FormData();
+    fd.append("chat_id", String(chat_id));
+    fd.append("caption", `📊 <b>${excelKind === "fuel" ? "Salyarka" : excelKind === "hr" ? "HR" : excelKind === "dpr" ? "DPR" : "Kassa"} jadvali</b> — oxirgi holat (${x.rows} qator)`);
+    fd.append("parse_mode", "HTML");
+    const ab = x.bytes.buffer.slice(x.bytes.byteOffset, x.bytes.byteOffset + x.bytes.byteLength) as ArrayBuffer;
+    fd.append("document", new Blob([ab], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), x.filename);
+    await fetch(`${TG_API}/sendDocument`, { method: "POST", body: fd });
+    return;
+  }
+
+  // «kechagi kun hisoboti» → Sheet asosida PDF
+  const reportDate = detectDayReportRequest(question);
+  if (reportDate) {
+    await tg("sendChatAction", { chat_id, action: "upload_document" });
+    if (await sendSpecialReport(chat_id, question, reportDate)) return;
+    const rep = await buildSheetDayPdf(reportDate).catch((e) => { console.error("day pdf", e); return null; });
+    if (!rep) {
+      await send(chat_id, "⚠️ Jadvalni o'qib bo'lmadi, PDF tayyorlanmadi. Birozdan keyin qayta so'rang.", menu());
+      return;
+    }
+    const f = (n: number) => Math.round(n).toLocaleString("ru-RU").replace(/[\s,\u00a0\u202f]/g, " ");
+    await nkSendPdf(
+      chat_id,
+      rep.bytes,
+      `PV_Olga_hisobot_${reportDate}.pdf`,
+      `📄 <b>${reportDate} hisoboti</b>\n🟢 Kirim: <b>${f(rep.inc)}</b>\n🔴 Chiqim: <b>${f(rep.exp)}</b>\n💰 Kun oxiri qoldiq: <b>${f(rep.balance)}</b> so'm`,
+    );
+    return;
+  }
+
+  const history: { role: "user" | "assistant"; content: string }[] = Array.isArray(session.data?.chat_history) ? session.data.chat_history : [];
+  history.push({ role: "user", content: question });
+  await tg("sendChatAction", { chat_id, action: isVoiceInput ? "record_voice" : "typing" });
+  // Ma'lumot manbai — Google Sheet (Master_Data), savol bo'yicha butun jadvaldan qidiradi
+  const [cashCtx, fuelCtx, hrCtx, dprCtx] = await Promise.all([
+    getSheetContext(question).catch(() => null),
+    getFuelContext(question).catch(() => null),
+    getHrContext(question).catch(() => null),
+    getDprContext(question).catch(() => null),
+  ]);
+  const sheetCtx = [cashCtx ? `MANBA 1 — NAQD KASSA (so'm):\n${cashCtx}` : "", fuelCtx ?? "", hrCtx ?? "", dprCtx ?? ""].filter(Boolean).join("\n\n") || null;
+  const agentHistory = sheetCtx
+    ? [
+        ...history.slice(0, -1),
+        {
+          role: "user" as const,
+          content: `Quyidagi Google Sheet ma'lumotlariga tayanib javob ber (moliya, kassa, xarajat, kirim savollari uchun asosiy manba shu):\n${sheetCtx}\n\nSAVOL: ${question}`,
+        },
+      ]
+    : history;
+  const reply = sheetCtx
+    ? await askSheetAi(history.slice(0, -1), sheetCtx, question, isVoiceInput)
+    : await askAgent(agentHistory, session.data?.project_id ?? null, isVoiceInput ? "voice" : "mobile", Number(msg?.from?.id ?? session.telegram_user_id));
+  history.push({ role: "assistant", content: reply });
+  session.data = { ...session.data, chat_history: history.slice(-12) };
+  await saveSession(session);
+  if (isVoiceInput) {
+    if (reply.startsWith("⚠️")) {
+      await send(chat_id, mdToHtml(reply).slice(0, 3800), menu());
+    } else {
+      const audio = await aishaTts(reply);
+      const ok = audio ? await sendVoice(chat_id, audio) : false;
+      if (!ok) {
+        await send(chat_id, "🔇 Ovozli javob yuborib bo'lmadi (TTS xatosi). Matn bilan beraman:", menu());
+        await send(chat_id, mdToHtml(reply).slice(0, 3800), menu());
+      }
+    }
+  } else {
+    await send(chat_id, mdToHtml(reply).slice(0, 3800), menu());
+  }
+}
+
+// ================= GURUH REJIMI =================
+// Guruhda bot jim turadi: faqat xarajat/kirimga o'xshash matn, ovoz yoki
+// izohli rasm kelganda ishga tushadi va yozuvni shu guruh daftariga qo'shadi.
+
+/** Matn xarajat/kirim yozuviga o'xshaydimi? */
+function looksLikeGroupEntry(raw: string): boolean {
+  const t = raw.trim();
+  if (t.length < 3) return false;
+  if (t.startsWith("/")) return false;
+  if (isIncomeText(t)) return true;
+  // Suhbatga aralashmaslik: savol, salomlashish, vaqt/manzil gaplari — xarajat emas.
+  if (/\?\s*$/.test(t)) return false;
+  const low = t.toLocaleLowerCase("uz");
+  if (/^(salom|assalom|rahmat|ok|xo['‘’`]?p|ha\b|yo['‘’`]?q\b)/.test(low)) return false;
+  if (!/[a-zA-Zа-яёА-ЯЁ']{3,}/.test(t)) return false;
+  // Summa bo'lishi shart: 4+ xonali son yoki «ming/mln/k/so'm» bilan yozilgan son.
+  const money = /\d[\d\s.,]{3,}\d|\d+(?:[.,]\d+)?\s*(ming|минг|тыс|mln|млн|million|k\b|so['‘’`]?m|сум|сўм)/i;
+  const fuel = /\d+\s*(l|litr|литр)\b/i.test(low) && /salyarka|solyarka|dizel|benzin|metan|propan/.test(low);
+  return money.test(low) || fuel;
+}
+
+/** Guruhga loyihani biriktiradi (bir marta), keyin eslab qoladi. */
+async function ensureGroupProject(session: Session): Promise<boolean> {
+  if (session.data?.project_id) return true;
+  const { data } = await admin()
+    .from("projects").select("id,name").eq("status", "active").order("created_at").limit(1);
+  const p = (data ?? [])[0] as { id: string; name: string } | undefined;
+  if (!p) {
+    await send(session.chat_id, "❌ Faol loyiha topilmadi. Avval tizimda loyiha yarating.");
+    return false;
+  }
+  session.data = { ...(session.data ?? {}), project_id: p.id, project_name: p.name };
+  await saveSession(session);
+  projectNameByChat.set(session.chat_id, p.name);
+  return true;
+}
+
+/**
+ * Guruhdagi yozuvni navbatga qo'yadi va qisqa «Qabul qilindi» javobini beradi.
+ * Tugmalar chiqmaydi — tasdiqlash botning shaxsiy chatidagi Daftarda bo'ladi.
+ */
+/** Telegram username → "@username" (ism bo'lsa o'zi). */
+function tgAuthorTag(u: string | null | undefined): string | null {
+  const v = String(u ?? "").trim();
+  if (!v) return null;
+  return /^[A-Za-z0-9_]{4,}$/.test(v) ? `@${v}` : v;
+}
+
+async function addToGroupDaftar(session: Session, items: any[], meta: { source: string; note: string }) {
+  if (!items.length) return;
+  const author = tgAuthorTag(session.username);
+  const tagged = items.map((it) => ({ ...it, _source: meta.source, _source_note: meta.note, _author: it._author ?? author }));
+  session.data = { ...(session.data ?? {}), draft: [...getDraft(session), ...tagged] };
+  await saveSession(session);
+  const lines = tagged.map((it) => {
+    const amount = Number(it.amount) || (Number(it.qty) || 1) * (Number(it.unit_price) || 0);
+    const name = it.kind === "income" ? (it.description ?? "Kirim") : (it.name ?? it.description ?? "Xarajat");
+    return `• ${name} — ${fmtMoney(amount)} so'm`;
+  });
+  await send(session.chat_id, `✅ <b>Qabul qilindi</b>\n${lines.join("\n")}`);
+}
+
+
+
+async function handleGroupMessage(msg: any) {
+  const chat_id = msg.chat.id;
+  const uid = msg.from?.id ?? chat_id;
+  const username = msg.from?.username ?? msg.from?.first_name ?? null;
+  const who = msg.from?.first_name ?? msg.from?.username ?? "";
+  let text: string = (msg.text ?? "").toString().trim();
+  // @bot_nomi mentionini olib tashlaymiz
+  text = text.replace(/@[A-Za-z0-9_]+bot\b/gi, "").trim();
+
+  // Guruhda istalgan a'zo xarajat yoza oladi — hammasi baribir Daftarga tushadi
+  // va admin tasdiqlaydi. Buyruqlar (/loyiha) faqat ro'yxatdagi foydalanuvchilarga.
+  const isRegistered = await isAllowedTgUser(uid);
+
+  const session = await getSession(chat_id, uid, username);
+  session.telegram_user_id = uid;
+  session.username = username;
+
+  const lower = text.toLocaleLowerCase("uz");
+  const cmd = lower.replace(/@[a-z0-9_]+$/i, "");
+
+  // ----- Fina (AI) tahlil guruhi rejimi -----
+  const aiGroups = String((await bzGetSetting("ai_group_chats")) ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  const isAiGroup = aiGroups.includes(String(chat_id));
+  if (cmd.startsWith("/rejim")) {
+    if (!isRegistered) return;
+    const arg = cmd.replace(/^\/rejim/, "").trim();
+    const next = arg.startsWith("ai")
+      ? Array.from(new Set([...aiGroups, String(chat_id)]))
+      : aiGroups.filter((x) => x !== String(chat_id));
+    await admin().from("app_settings").upsert({ key: "ai_group_chats", value: next.join(",") } as any, { onConflict: "key" });
+    await send(chat_id, arg.startsWith("ai")
+      ? "🧠 Bu guruh endi <b>Fina tahlil guruhi</b>. Savol, ovoz yoki hisobot so'rang — xarajat yozilmaydi."
+      : "📝 Bu guruh endi <b>xarajat yozish</b> guruhi.");
+    return;
+  }
+  if (isAiGroup) {
+    if (!isRegistered) return; // begonalarga jim
+    if (cmd === "/start") {
+      await send(chat_id, "🧠 <b>Boshqaruv va Fina tahlil guruhi</b>\nSavol yozing yoki ovoz yuboring, «kechagi hisobot» / «salyarka hisoboti» deb PDF so'rang.");
+      return;
+    }
+    const hasVoice = !!(msg.voice || msg.audio);
+    if (!hasVoice) {
+      if (!text || text.startsWith("/")) return;
+      // oddiy suhbatga aralashmaslik: faqat savol yoki hisobot so'rovi
+      const replyToBot = msg.reply_to_message?.from?.is_bot === true;
+      const isQuestion =
+        replyToBot ||
+        /@\w*bot|\bfina\b/i.test(String(msg.text ?? msg.caption ?? "")) ||
+        !!detectExcelRequest(text) ||
+        /(salyarka|sarf|farq|narx|shubha|bugun|kecha|oylik|kategoriya|chiqar|ayt|excel|exel|tahlil|maslahat|xarajat|kirim|chiqim)/i.test(lower) ||
+        /\?/.test(text) ||
+        !!detectDayReportRequest(text) ||
+        /\b(innoai|bot|qancha|nechta|necha|qancha|kim|qayer|qachon|nima|hisobot|pdf|qoldiq|jami|ber|ko'rsat|aytib)\b/i.test(lower);
+      if (!isQuestion) return;
+    }
+    aiAllowedByChat.set(chat_id, true);
+    await runAiChat(session, msg, text, true);
+    return;
+  }
+
+  // ----- Buyruqlar -----
+  if (cmd === "/start" || cmd === "/daftar" || /^(📒\s*)?daftar$/.test(cmd)) {
+    if (!(await ensureGroupProject(session))) return;
+    const n = getDraft(session).length;
+    await send(
+      chat_id,
+      `📝 Bu guruh faqat <b>xarajat yozish</b> uchun. Loyiha: <b>${session.data?.project_name ?? "—"}</b>\n` +
+        `Kutilayotgan yozuvlar: <b>${n} ta</b>\n\n` +
+        `Tasdiqlash botning shaxsiy chatidagi <b>Daftar</b> bo'limida.`,
+    );
+    return;
+  }
+  if (cmd.startsWith("/loyiha")) {
+    if (!isRegistered) return;
+    const q = text.slice(cmd.length).trim() || text.replace(/^\/loyiha(@\S+)?/i, "").trim();
+    const { data } = await admin().from("projects").select("id,name").eq("status", "active").order("name");
+    const list = (data ?? []) as Array<{ id: string; name: string }>;
+    const found = q ? list.find((p) => p.name.toLocaleLowerCase("uz").includes(q.toLocaleLowerCase("uz"))) : null;
+    if (!found) {
+      await send(chat_id, `📍 Loyihalar:\n${list.map((p) => `• ${p.name}`).join("\n")}\n\nTanlash: <code>/loyiha Nomi</code>`);
+      return;
+    }
+    session.data = { ...(session.data ?? {}), project_id: found.id, project_name: found.name };
+    await saveSession(session);
+    projectNameByChat.set(chat_id, found.name);
+    await send(chat_id, `✅ Guruh loyihasi: <b>${found.name}</b>`);
+    return;
+  }
+
+  // AI suhbat/hisobot guruhda ishlamaydi — faqat CEO uchun ochiq.
+  const isCeo = await checkCeoOnly(uid);
+  if (!isCeo && (cmd.startsWith("/ai") || detectDayReportRequest(text))) {
+    await send(chat_id, "ℹ️ Bu guruh faqat xarajat yozish uchun. Hisobot va AI botning shaxsiy chatida.");
+    return;
+  }
+
+  // ----- Ovozli xabar -----
+  const voiceId = msg.voice?.file_id ?? msg.audio?.file_id ?? null;
+  if (voiceId) {
+    if (!(await ensureGroupProject(session))) return;
+    const f = await uploadFile(voiceId, "audio/auto");
+    if (!f) return;
+    const transcript = await transcribeAudio(f.bytes, f.mime);
+    if (!transcript) return;
+    if (!looksLikeGroupEntry(transcript)) return;
+    const items = await aiParse(transcript, null);
+    if (!items.length) return;
+    await addToGroupDaftar(session, items, { source: "telegram_group_voice", note: `🎤 ${who}: "${transcript.slice(0, 200)}"` });
+    return;
+  }
+
+  // ----- Rasm (faqat izohi bo'lsa) -----
+  const photoFileId = msg.photo?.length ? msg.photo[msg.photo.length - 1].file_id : null;
+  const cap = (msg.caption ?? "").toString().trim();
+  if (photoFileId) {
+    if (!cap) return; // izohsiz rasm — oddiy suhbat rasmi, tegmaymiz
+    if (!(await ensureGroupProject(session))) return;
+    const f = await uploadFile(photoFileId, "image/auto");
+    if (!f) return;
+    const items = await aiParse(cap, f.dataUrl);
+    if (!items.length) return;
+    await addToGroupDaftar(session, items, { source: "telegram_group_photo", note: `🖼 ${who}: "${cap.slice(0, 200)}"` });
+    return;
+  }
+
+  // ----- Matn -----
+  if (!text) return;
+  if (!(await ensureGroupProject(session))) return;
+  if (!looksLikeGroupEntry(text)) return;
+  const items = await aiParse(text, null);
+  if (!items.length) return; // tushunmasa — guruhda jim
+  await addToGroupDaftar(session, items, { source: "telegram_group_text", note: `💬 ${who}: "${text.slice(0, 200)}"` });
+}
+
 export async function handleUpdate(update: any) {
+  void removeAiFromCommandMenu();
   if (update.callback_query) return handleCallback(update.callback_query);
 
   const msg = update.message;
@@ -1721,6 +2679,13 @@ export async function handleUpdate(update: any) {
   const username = msg.from?.username ?? msg.from?.first_name ?? null;
   const text: string = (msg.text ?? "").trim();
 
+  // ===== Guruh / superguruh =====
+  if (msg.chat?.type === "group" || msg.chat?.type === "supergroup") {
+    await handleGroupMessage(msg);
+    return;
+  }
+
+
   // ===== Tizimga kirish so'rovi (har kim uchun) — contactdan oldin =====
   if (await tryStartJoinRequest(chat_id, uid, username, text)) return;
   if (await tryHandleJoinFlow(chat_id, uid, username, msg)) return;
@@ -1729,22 +2694,208 @@ export async function handleUpdate(update: any) {
     if (await linkProfileByContact(chat_id, uid, username, msg.contact)) return;
   }
 
-  // 🔒 Faqat admin tomonidan Telegram ID si kiritilgan foydalanuvchilar
+  // 🔒 Begonalarga yopiq — kirish faqat taklif havolasi orqali
   if (!(await isAllowedTgUser(uid))) {
-    await send(
-      chat_id,
-      `<b>👋 Salom!</b>\n\nTizimga kirish uchun\n\n1️⃣ <b>/sorov</b> buyrug'ini yuboring — administrator tasdiqlaganidan keyin sizga PIN-kod beriladi.`
-    );
+    await send(chat_id, "🔒 Bu bot yopiq. Kirish faqat administrator yuborgan havola orqali.");
     return;
   }
 
 
   // ===== Admin buyruqlari =====
+  if (await tryHandleAdminFlow(chat_id, uid, msg)) return;
   if (await tryHandleAdminCommand(chat_id, uid, text)) return;
 
   const session = await getSession(chat_id, uid, username);
   // AI ruxsatini cache'ga olamiz (admin/PM/CEO uchun)
   aiAllowedByChat.set(chat_id, await checkAiAccess(uid));
+  const ceoOnly = await checkCeoOnly(uid);
+  ceoOnlyByChat.set(chat_id, ceoOnly);
+  buttonAccessByChat.set(chat_id, await loadButtonAccess(chat_id, uid));
+
+  // ===== CEO: botda faqat /start va AI savol-javob =====
+  if (ceoOnly) {
+    if (text === "/start" || text === "/menu") {
+      void tg("setChatMenuButton", { chat_id, menu_button: { type: "default" } });
+      session.flow = "ai_chat";
+      session.data = { ...session.data, chat_history: [] };
+      await saveSession(session);
+      await send(
+        chat_id,
+        `Salom, men <b>Fina</b>man — sizning sevimli yordamchingizman.\n\nLoyihalar bo'yicha ma'lumotlar va hisobot beraman.`,
+        mainMenu(getDraft(session).length, chat_id),
+      );
+      return;
+    }
+    if (session.flow !== "ai_chat") {
+      session.flow = "ai_chat";
+      await saveSession(session);
+    }
+    await runAiChat(session, msg, text, true);
+    return;
+  }
+
+  // ===== ⛽ Salyarka / 📋 DPR / 👥 HR tugmalari =====
+  if (!isGroupChat(chat_id)) {
+    const requestedButton: BotButtonKey | null = text === "📊 Loyiha" ? "project"
+      : text === "⛽ Salyarka" ? "fuel"
+        : /^(?:📒\s*)?Daftar \(/.test(text ?? "") ? "ledger"
+          : (text === "📄 DPR" || text === "📋 DPR") ? "dpr"
+            : text === "👥 HR" ? "hr"
+              : text === "✨ Fina" ? "innoai"
+                : null;
+    if (requestedButton && !canUseButton(chat_id, requestedButton)) {
+      await send(chat_id, "⛔ Bu bo'lim sizga biriktirilmagan.", mainMenu(getDraft(session).length, chat_id));
+      return;
+    }
+    const fuelKb = { keyboard: [[{ text: "↩️ Orqaga" }]], resize_keyboard: true };
+    if (text === "⛽ Salyarka") {
+      session.flow = "fuel";
+      await saveSession(session);
+      await send(chat_id, "⛽ <b>Salyarka</b>\n\nLitrni yozing yoki 🎤 ovoz yuboring (summa kerak emas).\nMasalan:\n• «Ekskavator 871 ga 100 litr — Javohir»\n• «Greyder 231 60 litr, Pogruzchik 060 40 litr»\n• «Bazaga 2000 litr keldi»\n\nYozuvlar faqat «PV olga Salyarka» jadvaliga tushadi.", fuelKb);
+      return;
+    }
+    if (text === "👥 HR") {
+      session.flow = "hr";
+      await saveSession(session);
+      await send(chat_id, "👥 <b>HR</b>\n\nXodim yozuvini yozing yoki 🎤 ovoz yuboring.\nMasalan:\n• «Javohir bugun ishda — prorab, Olg'a»\n• «Azamat kelmadi, kasal»\n• «Sardor ishga qabul qilindi, usta»\n• «Bekzod ishdan ketdi»\n\nYozuvlar faqat «PV Olg'a HR» jadvaliga tushadi.", fuelKb);
+      return;
+    }
+    if (text === "📄 DPR" || text === "📋 DPR") {
+      session.flow = "dpr";
+      await saveSession(session);
+      await send(chat_id, "📄 <b>DPR — kunlik ish hajmi</b>\n\nBajarilgan ishni yozing yoki 🎤 ovoz yuboring (summa kerak emas).\nMasalan:\n• «Tracker, 1-blok — saddle bracket 215 dona»\n• «3-blokda kabel 450 metr tortildi»\n• «Inshoot: beton 12 kub»\n\nYozuvlar faqat «PV DPR» jadvalining Daily_Log varag'iga tushadi.", fuelKb);
+      return;
+    }
+    if (session.flow === "fuel" || session.flow === "hr" || session.flow === "dpr") {
+      const menuBtn = text === "📊 Loyiha" || text === "📄 DPR" || text === "👥 HR" || text === "✨ Fina";
+      const isDaftar = /^(?:📒\s*)?Daftar \(/.test(text ?? "");
+      if (text === "↩️ Orqaga" || text === "/start" || text === "/menu" || isDaftar || menuBtn) {
+        session.flow = null;
+        await saveSession(session);
+        if (!isDaftar && !menuBtn) {
+          await send(chat_id, "↩️ Bosh menyu.", mainMenu(getDraft(session).length, chat_id));
+          return;
+        }
+        // Boshqa menyu tugmalari — pastdagi o'z handlerlariga o'tadi
+      } else if (session.flow === "hr") {
+        let raw = text ?? "";
+        if (!raw && (msg.voice || msg.audio)) {
+          const fid = msg.voice?.file_id ?? msg.audio?.file_id;
+          const f = await uploadFile(fid, `voice/hr`);
+          if (f) raw = (await transcribeAudio(f.bytes, f.mime)) ?? "";
+        }
+        if (!raw) { await send(chat_id, "📝 Matn yoki 🎤 ovoz yuboring.", fuelKb); return; }
+        const hrRepDate = detectDayReportRequest(raw);
+        if (hrRepDate) {
+          await tg("sendChatAction", { chat_id, action: "upload_document" });
+          await sendSpecialReport(chat_id, `hr ${raw}`, hrRepDate);
+          return;
+        }
+        await tg("sendChatAction", { chat_id, action: "typing" });
+        const entries = await aiParseHr(raw);
+        if (!entries.length) { await send(chat_id, "⚠️ Xodim yozuvini tushuna olmadim. Masalan: «Javohir bugun ishda — prorab».", fuelKb); return; }
+        const r = await appendHrEntries(entries, `${chat_id}:${msg.message_id}`);
+        if (r.error) { await send(chat_id, `⚠️ Jadvalga yozilmadi: ${r.error.slice(0, 150)}`, fuelKb); return; }
+        const lines = entries.map((e) => `• ${e.name}${e.role ? ` (${e.role})` : ""} — <b>${e.type}</b>`);
+        await send(chat_id, `✅ HR jadvaliga ${r.appended} ta yozuv qo'shildi:\n${lines.join("\n")}`, fuelKb);
+        return;
+      } else if (session.flow === "dpr") {
+        let raw = text ?? "";
+        if (!raw && (msg.voice || msg.audio)) {
+          const fid = msg.voice?.file_id ?? msg.audio?.file_id;
+          const f = await uploadFile(fid, `voice/dpr`);
+          if (f) raw = (await transcribeAudio(f.bytes, f.mime)) ?? "";
+        }
+        if (!raw) { await send(chat_id, "📝 Matn yoki 🎤 ovoz yuboring.", fuelKb); return; }
+        const dprRepDate = detectDayReportRequest(raw);
+        if (dprRepDate) {
+          await tg("sendChatAction", { chat_id, action: "upload_document" });
+          await sendSpecialReport(chat_id, `dpr ${raw}`, dprRepDate);
+          return;
+        }
+        await tg("sendChatAction", { chat_id, action: "typing" });
+        const entries = await aiParseDpr(raw);
+        if (!entries.length) { await send(chat_id, "⚠️ Ish hajmini tushuna olmadim. Masalan: «Tracker, 1-blok — saddle bracket 215 dona».", fuelKb); return; }
+        const r = await appendDprEntries(entries, `${chat_id}:${msg.message_id}`);
+        if (r.error) { await send(chat_id, `⚠️ Jadvalga yozilmadi: ${r.error.slice(0, 150)}`, fuelKb); return; }
+        const lines = entries.map((e) => `• ${e.direction || "—"}${e.block ? `, ${e.block}-blok` : ""} — ${e.work}: <b>${e.qty} ${e.unit}</b>`);
+        await send(chat_id, `✅ DPR jadvaliga ${r.appended} ta yozuv qo'shildi:\n${lines.join("\n")}`, fuelKb);
+        return;
+      } else {
+        let raw = text ?? "";
+        if (!raw && (msg.voice || msg.audio)) {
+          const fid = msg.voice?.file_id ?? msg.audio?.file_id;
+          const f = await uploadFile(fid, `voice/fuel`);
+          if (f) raw = (await transcribeAudio(f.bytes, f.mime)) ?? "";
+        }
+        if (!raw) { await send(chat_id, "📝 Matn yoki 🎤 ovoz yuboring.", fuelKb); return; }
+        const fuelRepDate = detectDayReportRequest(raw);
+        if (fuelRepDate) {
+          await tg("sendChatAction", { chat_id, action: "upload_document" });
+          await sendSpecialReport(chat_id, `salyarka ${raw}`, fuelRepDate);
+          return;
+        }
+        await tg("sendChatAction", { chat_id, action: "typing" });
+        const entries = await aiParseFuel(raw);
+        if (!entries.length) { await send(chat_id, "⚠️ Litrni tushuna olmadim. Masalan: «Ekskavator 871 ga 100 litr — Javohir».", fuelKb); return; }
+        const r = await appendFuelEntries(entries, `${chat_id}:${msg.message_id}`);
+        if (r.error) { await send(chat_id, `⚠️ Jadvalga yozilmadi: ${r.error.slice(0, 150)}`, fuelKb); return; }
+        const lines = entries.map((e) => `• ${e.type === "KIRIM" ? "📥 KIRIM" : "📤"} ${e.tech || "—"}${e.driver ? ` (${e.driver})` : ""} — <b>${e.liters} l</b>`);
+        await send(chat_id, `✅ Salyarka jadvaliga ${r.appended} ta yozuv qo'shildi:\n${lines.join("\n")}`, fuelKb);
+        return;
+      }
+    }
+  }
+
+  // ===== Kunlik hisobot — davom etayotgan oqim =====
+  if (session.flow === "dr" && (session.data?.dr?._pending && session.data?.dr?._pending !== "none")) {
+    // Rasm qabul qilish
+    const pending = session.data?.dr?._pending;
+    const photoFid = msg.photo?.length ? msg.photo[msg.photo.length - 1].file_id : null;
+    const docImg = msg.document && (msg.document.mime_type ?? "").startsWith("image/");
+    if (pending === "photo" && (photoFid || docImg)) {
+      const fid = photoFid ?? msg.document.file_id;
+      const f = await uploadFile(fid, "daily-report");
+      const d = session.data?.dr ?? {};
+      if (f) d.photo_url = f.url;
+      else d.photo_url = `tg:${fid}`;
+      d._pending = "none";
+      session.flow = "dr";
+      session.step = "summary";
+      session.data = { ...(session.data ?? {}), dr: d };
+      await saveSession(session);
+      await send(chat_id, f ? "🖼 Rasm qabul qilindi." : "🖼 Rasm yuklab olinmadi, lekin davom etamiz.");
+      await drShowSummary(session, chat_id);
+      return;
+    }
+    // Matn qabul qilish
+    if (await drHandleText(session, chat_id, text)) return;
+  }
+
+  // ===== Kunlik hisobot — Excel fayl yoki daftar rasmini o'qish =====
+  if (session.flow === "dr" && (session.data?.dr?._pending ?? "none") === "none") {
+    const impPhoto = msg.photo?.length ? msg.photo[msg.photo.length - 1].file_id : null;
+    const impDoc = msg.document ?? null;
+    if (impPhoto || impDoc) {
+      const pid = session.data?.dr?.project_id ?? session.data?.project_id;
+      if (!pid) {
+        await send(chat_id, "❌ Avval loyihani tanlang.");
+        await showProjectPicker(chat_id, null);
+        return;
+      }
+      await drImportFile(
+        session,
+        chat_id,
+        pid,
+        impPhoto ?? impDoc.file_id,
+        impDoc?.file_name ?? "",
+        impDoc?.mime_type ?? "",
+      );
+      return;
+    }
+  }
+
+
 
   if (text === "/start" || text === "/menu") {
     // Chat menu tugmasini default holatga qaytaramiz (commands ro'yxati)
@@ -1771,11 +2922,12 @@ export async function handleUpdate(update: any) {
     }
     await send(
       chat_id,
-      `<b>👋 Salom, ${linked.full_name ?? "—"}!</b>\n\nIshni boshlash uchun loyihani tanlang.`,
+      `<b>👋 Salom, ${linked.full_name ?? "—"}!</b>`,
     );
     await showProjectPicker(chat_id, null);
     return;
   }
+
 
 
   // Cache project name for header
@@ -1978,6 +3130,7 @@ export async function handleUpdate(update: any) {
 
 
   if (
+    text === "📊 Loyiha" ||
     text === "🏢 Firma / Loyiha" ||
     text === "🏢 Loyiha almashtirish" ||
     text === "/loyiha" ||
@@ -2135,7 +3288,7 @@ export async function handleUpdate(update: any) {
 
   // Loyiha tanlanmagan bo'lsa — har qanday bo'limga kirishni bloklash
   const sectionTexts = [
-    "📋 Smeta", "💼 Buxgalteriya",
+    "📋 Smeta", "💼 Buxgalteriya", "📦 Material qabul",
     "📦 Materiallar", "🔨 Ish turlari", "➕ Qo'shimcha (rejadan tashqari)",
     "🚚 Nakladnoy", "🚚 Noklodnoy", "📝 Buyurtma", "📝 Buyurtma (zayavka)", "📝 Zayavka",
     "📄 Shartnoma", "🧾 Faktura", "💸 To'lov so'rash",
@@ -2144,7 +3297,7 @@ export async function handleUpdate(update: any) {
   if (!session.data?.project_id && sectionTexts.includes(text)) {
     await send(
       chat_id,
-      `${blinkEmoji()} <b>AVVAL LOYIHANI TANLANG!</b>\n\nIshni boshlash uchun pastdagi ro'yxatdan loyihani tanlang 👇`,
+      "⏳ Loyiha aniqlanmoqda...",
     );
     await showProjectPicker(chat_id, null);
     return;
@@ -2153,6 +3306,22 @@ export async function handleUpdate(update: any) {
   // ===== Menyu navigatsiyasi =====
   if (text === "📋 Smeta") {
     await send(chat_id, "📋 <b>Smeta (B.O.Q):</b>\nQaysi bo'limni ko'rmoqchisiz?", smetaMenu());
+    return;
+  }
+  if (text === "📦 Material qabul") {
+    const pid = session.data?.project_id;
+    if (!pid) { await send(chat_id, "❌ Avval loyihani tanlang."); await showProjectPicker(chat_id, null); return; }
+    await showSmetaPicker(chat_id, "material", pid);
+    return;
+  }
+  if (text === "➕ Yangi hisobot") {
+    const pid = session.data?.project_id;
+    if (!pid) { await send(chat_id, "❌ Avval loyihani tanlang."); await showProjectPicker(chat_id, null); return; }
+    session.data = { ...(session.data ?? {}), dr: { project_id: pid } };
+    session.flow = "dr";
+    session.step = "pick";
+    await saveSession(session);
+    await drShowItems(chat_id, pid);
     return;
   }
   if (text === "💼 Buxgalteriya") {
@@ -2351,14 +3520,18 @@ export async function handleUpdate(update: any) {
     return;
   }
 
-  if (text === "📒 Daftar" || text.startsWith("📒 Daftar") || text === "/daftar" || text === "📋 Draft" || text.startsWith("📋 Draft") || text === "/draft") {
+  if (/^(📒\s*)?daftar/i.test(text) || text === "/daftar" || text === "📋 Draft" || text.startsWith("📋 Draft") || text === "/draft") {
+    if (!canUseButton(chat_id, "ledger")) {
+      await send(chat_id, "⛔ Bu bo'lim sizga biriktirilmagan.", mainMenu(getDraft(session).length, chat_id));
+      return;
+    }
     await showDaftar(session);
     return;
   }
 
   if (text === "✅ Tasdiqlash" || text === "/tasdiq") {
     if (!getDraft(session).length) {
-      await send(chat_id, "📒 Daftar bo'sh — hech narsa saqlanmadi.", mainMenu(0, chat_id));
+      await send(chat_id, "Daftar bo'sh — hech narsa saqlanmadi.", mainMenu(0, chat_id));
       return;
     }
     await showDaftar(session);
@@ -2373,18 +3546,17 @@ export async function handleUpdate(update: any) {
   }
 
   // ---------- AI Chat rejimi (faqat /ai komandasi orqali, admin/PM/CEO) ----------
-  if (text === "/ai") {
-    if (aiAllowedByChat.get(chat_id) !== true) {
+  if (text === "/ai" || text === "✨ Fina") {
+    if (aiAllowedByChat.get(chat_id) !== true || !canUseButton(chat_id, "innoai")) {
       await send(chat_id, "⛔ Bu bo'lim faqat <b>Admin</b>, <b>PM</b> va <b>CEO (Direktor)</b> uchun.", mainMenu(getDraft(session).length, chat_id));
       return;
     }
     session.flow = "ai_chat";
     session.data = { ...session.data, chat_history: [] };
     await saveSession(session);
-    const pname = session.data?.project_name ?? "loyiha tanlanmagan";
     await send(
       chat_id,
-      `💬 <b>AI yordamchi</b>\n\n🏗 ${pname}\n\nIstalgan savol bering — loyiha holati, moliya, ombor, brigadalar, xodimlar, shartnomalar, hisobotlar yoki umumiy maslahat. Matn yoki ovoz qabul qilaman.`,
+      "Salom, men <b>Fina</b>man — sizning sevimli yordamchingizman.\n\nLoyihalar bo'yicha ma'lumotlar va hisobot beraman.",
       chatMenu()
     );
     return;
@@ -2392,60 +3564,10 @@ export async function handleUpdate(update: any) {
 
 
   if (session.flow === "ai_chat") {
-    if (aiAllowedByChat.get(chat_id) !== true) {
-      session.flow = null;
-      await saveSession(session);
-      await send(chat_id, "⛔ AI yordamchiga ruxsat yo'q.", mainMenu(getDraft(session).length, chat_id));
-      return;
-    }
-    if (text === "⬅️ Orqaga" || text === "🚪 Chatdan chiqish" || text === "/chiqish" || text === "🧹 Suhbatni tozalash") {
-      session.flow = null;
-      session.data = { ...session.data, chat_history: [] };
-      await saveSession(session);
-      await send(chat_id, "⬅️ Asosiy menyuga qaytdingiz.", mainMenu(getDraft(session).length, session.chat_id));
-      return;
-    }
-
-
-    // Ovoz → transkripsiya → savol
-    let question = text;
-    const isVoiceInput = !text && !!(msg.voice || msg.audio);
-    if (!question && (msg.voice || msg.audio)) {
-      const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
-      const f = await uploadFile(fileId, `voice/chat`);
-      if (f) {
-        await send(chat_id, "🎧 Ovoz tinglanmoqda...");
-        question = (await transcribeAudio(f.bytes, f.mime)) ?? "";
-      }
-    }
-    if (!question) {
-      await send(chat_id, "📝 Savolni matn yoki ovoz orqali yuboring.", chatMenu());
-      return;
-    }
-
-    const history: { role: "user" | "assistant"; content: string }[] = Array.isArray(session.data?.chat_history) ? session.data.chat_history : [];
-    history.push({ role: "user", content: question });
-    await tg("sendChatAction", { chat_id, action: isVoiceInput ? "record_voice" : "typing" });
-    const reply = await askAgent(history, session.data?.project_id ?? null, isVoiceInput ? "voice" : "mobile");
-    history.push({ role: "assistant", content: reply });
-    session.data = { ...session.data, chat_history: history.slice(-12) };
-    await saveSession(session);
-    if (isVoiceInput) {
-      if (reply.startsWith("⚠️")) {
-        await send(chat_id, mdToHtml(reply).slice(0, 3800), chatMenu());
-      } else {
-        const audio = await aishaTts(reply);
-        const ok = audio ? await sendVoice(chat_id, audio) : false;
-        if (!ok) {
-          await send(chat_id, "🔇 Ovozli javob yuborib bo'lmadi (TTS xatosi). Matn bilan beraman:", chatMenu());
-          await send(chat_id, mdToHtml(reply).slice(0, 3800), chatMenu());
-        }
-      }
-    } else {
-      await send(chat_id, mdToHtml(reply).slice(0, 3800), chatMenu());
-    }
+    await runAiChat(session, msg, text, ceoOnlyByChat.get(chat_id) === true);
     return;
   }
+
 
   if (!session.data?.project_id) {
     await send(chat_id, "Avval loyihani tanlang.");
@@ -2465,6 +3587,11 @@ export async function handleUpdate(update: any) {
       await send(chat_id, "⚠️ Ovozni tushuna olmadim. Yozma yuboring.", mainMenu(getDraft(session).length, session.chat_id));
       return;
     }
+    if (await tryDaftarCommand(session, transcript)) return;
+    if (isEditIntent(transcript.toLocaleLowerCase("uz"))) {
+      await send(chat_id, "⚠️ Qaysi yozuvni o'zgartirishni tushunmadim. Qator raqamini ayting (masalan: «2-qator summasi 350 ming»).", mainMenu(getDraft(session).length, chat_id));
+      return;
+    }
     const items = await aiParse(transcript, null);
     await addToDraft(session, items, { source: "telegram_voice", note: `🎤 "${transcript.slice(0, 200)}"` });
     return;
@@ -2478,7 +3605,8 @@ export async function handleUpdate(update: any) {
     const f = await uploadFile(fileId, `image/auto`);
     if (!f) { await send(chat_id, "❌ Rasm yuklab olinmadi."); return; }
     const cap = (msg.caption ?? "").toString().trim();
-    const items = await aiParse(cap || null, f.url);
+    await send(chat_id, "🖼 Rasm o'qilmoqda...");
+    const items = await aiParse(cap || null, f.dataUrl);
     await addToDraft(session, items, {
       source: "telegram_photo",
       note: `🖼 Rasm${cap ? ` — "${cap.slice(0, 200)}"` : ""}`,
@@ -2488,6 +3616,11 @@ export async function handleUpdate(update: any) {
 
   // Matn
   if (text) {
+    if (await tryDaftarCommand(session, text)) return;
+    if (getDraft(session).length && isEditIntent(text.toLocaleLowerCase("uz"))) {
+      await send(chat_id, "⚠️ Qaysi yozuvni o'zgartirishni tushunmadim. Qator raqamini ayting (masalan: «2-qator summasi 350 ming»).", mainMenu(getDraft(session).length, chat_id));
+      return;
+    }
     const items = await aiParse(text, null);
     await addToDraft(session, items, { source: "telegram_text", note: `💬 "${text.slice(0, 200)}"` });
     return;
@@ -2514,6 +3647,19 @@ async function handleCallback(cb: any) {
   }
 
   const session = await getSession(chat_id, uid, username);
+  buttonAccessByChat.set(chat_id, await loadButtonAccess(chat_id, uid));
+
+  // ===== Kunlik hisobot callback'lari =====
+  if (data.startsWith("dr:")) {
+    if (await drHandleCallback(session, cb, data)) return;
+    // dr:field — qo'shimcha ma'lumot so'rovlari
+    if (data.startsWith("dr:field:")) {
+      await drHandleField(session, cb, data.slice("dr:field:".length));
+      return;
+    }
+    await answerCb(cb.id);
+    return;
+  }
 
   // ===== /setlocation radius tanlash =====
   if (data.startsWith("geor:")) {
@@ -2918,4 +4064,538 @@ async function handleCallback(cb: any) {
   }
 
   await answerCb(cb.id);
+}
+
+// ================= Kunlik hisobot (Daily Report) — bot oqimi =================
+// Rol: faqat prorab / pm / admin / finans. Boshqalar uchun "📋 Kunlik hisobot" ishlamaydi.
+
+
+function drMenu() {
+  return {
+    keyboard: [
+      [{ text: "➕ Yangi hisobot" }],
+      [{ text: "📦 Material qabul" }],
+      [{ text: "↩️ Orqaga" }],
+    ],
+    resize_keyboard: true,
+  };
+}
+
+// ---- Excel / daftar rasmi orqali ommaviy import ----
+type DrImportLine = {
+  zayavka_id: string | null;
+  name: string;
+  unit: string | null;
+  qty: number;
+  brigade_name?: string | null;
+  workers_count?: number | null;
+  equipment_name?: string | null;
+  equipment_hours?: number | null;
+  note?: string | null;
+};
+
+async function excelToText(bytes: Uint8Array): Promise<string> {
+  const XLSX = await import("xlsx");
+  const wb = XLSX.read(bytes, { type: "array" });
+  const parts: string[] = [];
+  for (const sn of wb.SheetNames.slice(0, 3)) {
+    const ws = wb.Sheets[sn];
+    if (!ws) continue;
+    parts.push(`### ${sn}\n${XLSX.utils.sheet_to_csv(ws)}`);
+  }
+  return parts.join("\n\n").slice(0, 12000);
+}
+
+async function drImportFile(
+  session: Session,
+  chat_id: number,
+  project_id: string,
+  file_id: string,
+  file_name: string,
+  mime: string,
+) {
+  await send(chat_id, "⏳ Fayl o'qilmoqda, biroz kuting...");
+  const f = await uploadFile(file_id, "daily-report");
+  if (!f) { await send(chat_id, "⚠️ Faylni yuklab bo'lmadi. Qayta yuboring."); return; }
+
+  const isExcel =
+    /\.(xlsx|xls|csv)$/i.test(file_name) ||
+    mime.includes("spreadsheet") ||
+    mime.includes("excel") ||
+    mime === "text/csv";
+
+  const { data: boq } = await admin()
+    .from("project_zayavka")
+    .select("id,name,unit,kind")
+    .eq("project_id", project_id)
+    .is("parent_id", null)
+    .in("kind", ["work", "ustalar"])
+    .limit(300);
+  const boqList = ((boq ?? []) as any[])
+    .map((b) => `${b.id}|${b.name} (${b.unit ?? "-"}) [${b.kind}]`)
+    .join("\n");
+
+  const systemPrompt = `Sen qurilish loyihasi kunlik hisobotini o'qiydigan AI san.
+Foydalanuvchi Excel jadval matni yoki daftarga qo'lda yozilgan hisobot rasmini yuboradi (o'zbek/rus tilida).
+DIQQAT: faqat BAJARILGAN ISH va USTALAR satrlarini ol. Material qabul (olingan material, narx, nakladnoy) satrlarini butunlay TASHLA.
+Har bir satrni o'qib JSON qaytar:
+{"lines":[{"zayavka_id":"BOQ id yoki null","name":"ish/material nomi","unit":"birlik yoki null","qty":son,"brigade_name":null,"workers_count":null,"equipment_name":null,"equipment_hours":null,"note":null}],"issues":null,"notes":null}
+Qoidalar:
+- Har bir satr uchun quyidagi BOQ ro'yxatidan eng mos qatorni topib zayavka_id ni yoz. Mos kelmasa null.
+- qty — bugun bajarilgan hajm (faqat son).
+- Sarlavha, jami/итого satrlarini tashla.
+- Muammolar bo'lsa issues ga, umumiy izoh notes ga yoz.
+- Faqat JSON qaytar.
+
+BOQ ro'yxati (id|nom (birlik) [tur]):
+${boqList || "(bo'sh)"}`;
+
+  const userParts: any[] = isExcel
+    ? [{ type: "text", text: `Excel hisobot matni:\n${await excelToText(f.bytes)}` }]
+    : [
+        { type: "text", text: "Daftarga yozilgan kunlik hisobot rasmi. O'qib JSON qaytar." },
+        { type: "image_url", image_url: { url: f.dataUrl } },
+      ];
+
+  const parsed = await callAi(systemPrompt, userParts);
+  const rawLines: any[] = Array.isArray(parsed?.lines) ? parsed.lines : [];
+  const lines: DrImportLine[] = rawLines
+    .map((l) => ({
+      zayavka_id: typeof l?.zayavka_id === "string" && l.zayavka_id.length > 20 ? l.zayavka_id : null,
+      name: String(l?.name ?? "").trim(),
+      unit: l?.unit ? String(l.unit) : null,
+      qty: Number(l?.qty) || 0,
+      brigade_name: l?.brigade_name ? String(l.brigade_name) : null,
+      workers_count: Number(l?.workers_count) || null,
+      equipment_name: l?.equipment_name ? String(l.equipment_name) : null,
+      equipment_hours: Number(l?.equipment_hours) || null,
+      note: l?.note ? String(l.note) : null,
+    }))
+    .filter((l) => l.name && l.qty > 0);
+
+  if (!lines.length) {
+    await send(chat_id, `⚠️ Hisobotni o'qib bo'lmadi.${lastAiError ? `\n${lastAiError}` : ""}\nJadval ustunlari: nomi | birlik | hajm bo'lsin yoki rasm aniqroq bo'lsin.`);
+    return;
+  }
+
+  session.flow = "dr";
+  session.step = "import";
+  session.data = {
+    ...(session.data ?? {}),
+    dr: {
+      ...(session.data?.dr ?? {}),
+      project_id,
+      _pending: "none",
+      import: {
+        lines,
+        issues: parsed?.issues ? String(parsed.issues) : null,
+        notes: parsed?.notes ? String(parsed.notes) : null,
+        file_url: f.url,
+        photo_url: isExcel ? null : f.url,
+      },
+    },
+  };
+  await saveSession(session);
+
+  const preview = lines
+    .map((l, i) => `${i + 1}. ${l.zayavka_id ? "✅" : "⚠️"} ${l.name} — <b>${l.qty}</b>${l.unit ? " " + l.unit : ""}${l.brigade_name ? ` · 👷 ${l.brigade_name}` : ""}`)
+    .join("\n");
+  const unmatched = lines.filter((l) => !l.zayavka_id).length;
+  await send(
+    chat_id,
+    `📄 <b>Fayldan o'qildi</b> (${lines.length} qator)\n\n${preview}` +
+      (unmatched ? `\n\n⚠️ ${unmatched} qator BOQ ga bog'lanmadi — ular faqat hisobotda qoladi.` : "") +
+      (parsed?.issues ? `\n\n⚠️ Muammo: ${parsed.issues}` : ""),
+    {
+      inline_keyboard: [
+        [{ text: "✅ Saqlash", callback_data: "dr:impsave" }],
+        [{ text: "↩️ Bekor qilish", callback_data: "dr:cancel" }],
+      ],
+    },
+  );
+}
+
+async function drSaveImport(session: Session, chat_id: number, message_id?: number) {
+  const d = session.data?.dr ?? {};
+  const imp = d.import;
+  const project_id = d.project_id ?? session.data?.project_id;
+  if (!imp?.lines?.length || !project_id) {
+    await send(chat_id, "❌ Saqlash uchun ma'lumot topilmadi.", drMenu());
+    return;
+  }
+  const sb = admin();
+  const uid = session.telegram_user_id;
+  let reporter = "";
+  try {
+    const { data: p } = await sb.from("profiles").select("full_name").eq("telegram_user_id", uid).maybeSingle();
+    reporter = p?.full_name ?? "";
+  } catch { /* e'tiborsiz */ }
+
+  const { data: rp, error: rpErr } = await sb
+    .from("daily_reports")
+    .insert({
+      project_id,
+      report_date: new Date().toISOString().slice(0, 10),
+      telegram_user_id: uid,
+      reporter_name: reporter,
+      issues: imp.issues ?? null,
+      notes: imp.notes ?? null,
+      photo_url: imp.photo_url ?? null,
+    })
+    .select("id")
+    .maybeSingle();
+  if (rpErr || !rp?.id) { await send(chat_id, `⚠️ Saqlashda xatolik: ${rpErr?.message ?? "no id"}`); return; }
+
+  const rows = (imp.lines as DrImportLine[]).map((l) => ({
+    report_id: rp.id,
+    zayavka_id: l.zayavka_id,
+    activity_name: l.name,
+    unit: l.unit,
+    qty_done: l.qty,
+    brigade_name: l.brigade_name ?? null,
+    workers_count: l.workers_count ?? null,
+    equipment_name: l.equipment_name ?? null,
+    equipment_hours: l.equipment_hours ?? null,
+    note: l.note ?? null,
+  }));
+  const { error: linesErr } = await sb.from("daily_report_lines").insert(rows);
+  if (linesErr) { await send(chat_id, `⚠️ Qatorlar saqlanmadi: ${linesErr.message}`); return; }
+
+  await drRecompute(project_id);
+
+  session.flow = "dr";
+  session.step = "menu";
+  session.data = { ...(session.data ?? {}), dr: {} };
+  await saveSession(session);
+
+  const okText = `✅ <b>Hisobot saqlandi</b> — ${rows.length} ta qator kiritildi.`;
+  if (message_id) { try { await editText(chat_id, message_id, okText); } catch { await send(chat_id, okText); } }
+  else await send(chat_id, okText);
+  await send(chat_id, "Yana hisobot berish uchun «➕ Yangi hisobot» tugmasini bosing.", drMenu());
+}
+
+
+
+
+// Prorab uchun loyihadagi BOQ aktivitilarini tanlash (inline tugmalar)
+async function drShowItems(chat_id: number, project_id: string, message_id?: number) {
+  const sb = admin();
+  const { data, error } = await sb
+    .from("project_zayavka")
+    .select("id,name,unit,qty,unit_price,kind,off_plan")
+    .eq("project_id", project_id)
+    .is("parent_id", null)
+    .in("kind", ["work", "ustalar"])
+    .order("name", { ascending: true })
+    .limit(80);
+  if (error) { await send(chat_id, `⚠️ Xatolik: ${error.message}`); return; }
+  const items = (data ?? []) as any[];
+  if (!items.length) {
+    await send(chat_id, "📋 Bu loyihada hisobot uchun BOQ qatorlari yo'q.");
+    return;
+  }
+  const kb = items.map((it) => [
+    { text: `${it.kind === "ustalar" ? "👷" : "🔨"} ${it.name}${it.unit ? ` (${it.unit})` : ""}`, callback_data: `dr:pick:${it.id}` },
+  ]);
+  kb.push([{ text: "↩️ Bekor qilish", callback_data: "dr:cancel" }]);
+  const text = `🔨 <b>Ish / Ustalar (BOQ)</b> (${items.length} ta)\nBugun bajarilgan ish turini tanlang:`;
+  if (message_id) await editText(chat_id, message_id, text, { inline_keyboard: kb });
+  else await send(chat_id, text, { inline_keyboard: kb });
+}
+
+// Kunlik hisobotdan hisoblangan bajarilishni qayta hisoblash
+async function drRecompute(project_id: string) {
+  try {
+    const sb = admin();
+    const { data: all } = await sb.from("project_zayavka").select("id").eq("project_id", project_id);
+    const ids = new Set<string>();
+    for (const z of (all ?? []) as any[]) ids.add(z.id as string);
+    for (const zid of ids) {
+      try { await sb.rpc("recompute_zayavka_progress", { _zid: zid }); } catch { /* tuzatilmaydi */ }
+    }
+  } catch { /* izolyatsiya */ }
+}
+
+// Saqlash
+async function drSave(session: Session, chat_id: number, message_id?: number) {
+  const d = session.data?.dr ?? {};
+  const project_id = d.project_id ?? session.data?.project_id;
+  if (!project_id || !d.zayavka_id) {
+    await send(chat_id, "❌ Hisobot to'liq emas. Qaytadan boshlang.", drMenu());
+    session.flow = "dr"; session.step = "menu";
+    await saveSession(session);
+    return;
+  }
+  const sb = admin();
+  const uid = session.telegram_user_id;
+  let reporter = "";
+  try {
+    const { data: p } = await sb.from("profiles").select("full_name").eq("telegram_user_id", uid).maybeSingle();
+    reporter = p?.full_name ?? "";
+  } catch { /* e'tiborsiz */ }
+  const { data: rp, error: rpErr } = await sb
+    .from("daily_reports")
+    .insert({
+      project_id,
+      report_date: new Date().toISOString().slice(0, 10),
+      telegram_user_id: uid,
+      reporter_name: reporter,
+      issues: d.issues ?? null,
+      notes: d.note ?? null,
+      photo_url: d.photo_url ?? null,
+    })
+    .select("id")
+    .maybeSingle();
+  if (rpErr || !rp?.id) {
+    await send(chat_id, `⚠️ Saqlashda xatolik: ${rpErr?.message ?? "no id"}`);
+    return;
+  }
+  const { error: lineErr } = await sb.from("daily_report_lines").insert({
+    report_id: rp.id,
+    zayavka_id: d.zayavka_id,
+    activity_name: d.name ?? "",
+    unit: d.unit ?? null,
+    qty_done: Number(d.qty) || 0,
+    brigade_name: d.brigade_name ?? null,
+    workers_count: d.workers_count ? Number(d.workers_count) : null,
+    equipment_name: d.equipment_name ?? null,
+    equipment_hours: d.equipment_hours ? Number(d.equipment_hours) : null,
+    note: d.note ?? null,
+  });
+  if (lineErr) {
+    await send(chat_id, `⚠️ Qator saqlanmadi: ${lineErr.message}`);
+    return;
+  }
+  // Zayavka progressni qayta hisoblash
+  try { await sb.rpc("recompute_zayavka_progress", { _zid: d.zayavka_id }); } catch { /* izolyatsiya */ }
+  await drRecompute(project_id);
+
+  const out = [
+    "✅ <b>Kunlik hisobot saqlandi!</b>",
+    `📌 ${d.name ?? ""}${d.unit ? ` (${d.unit})` : ""}`,
+    `🔢 Hajm: <b>${Number(d.qty) || 0}</b>${d.unit ? " " + d.unit : ""}`,
+  ];
+  if (d.brigade_name) out.push(`👥 Brigada: ${d.brigade_name}`);
+  if (d.workers_count) out.push(`🧑\u200d🤝\u200d🧑 Ishchilar: ${d.workers_count} ishchi`);
+  if (d.equipment_name) out.push(`🚜 Texnika: ${d.equipment_name}${d.equipment_hours ? ` · ${d.equipment_hours} soat` : ""}`);
+  if (d.issues) out.push(`⚠️ Muammo: ${d.issues}`);
+  if (d.note) out.push(`📝 Izoh: ${d.note}`);
+  if (d.photo_url) out.push(`🖼 Rasm ilova qilindi`);
+
+  // Session tozalash
+  session.flow = "dr";
+  session.step = "menu";
+  session.data = { ...(session.data ?? {}), dr: {} };
+  await saveSession(session);
+  const finalText = out.join("\n");
+  if (message_id) {
+    try { await editText(chat_id, message_id, finalText); } catch { await send(chat_id, finalText); }
+  } else {
+    await send(chat_id, finalText);
+  }
+  await send(chat_id, "Yana hisobot berish uchun «➕ Yangi hisobot» tugmasini bosing.", drMenu());
+}
+
+// ================= Kunlik hisobot — inline callback =================
+async function drHandleCallback(session: Session, cb: any, data: string): Promise<boolean> {
+  const chat_id = cb.message?.chat?.id ?? session.chat_id;
+  const message_id = cb.message?.message_id;
+  if (data.startsWith("dr:pick:")) {
+    const id = data.slice("dr:pick:".length);
+    const { data: it } = await admin()
+      .from("project_zayavka")
+      .select("id,name,unit,qty,unit_price,kind")
+      .eq("id", id)
+      .maybeSingle();
+    if (!it) { await send(chat_id, "❌ Qator topilmadi."); await answerCb(cb.id); return true; }
+    session.flow = "dr";
+    session.step = "qty";
+    session.data = {
+      ...(session.data ?? {}),
+      dr: { ...(session.data?.dr ?? {}), zayavka_id: it.id, name: it.name, unit: it.unit ?? "", kind: it.kind, _pending: "qty" },
+    };
+    await saveSession(session);
+    if (message_id) await editText(chat_id, message_id, `✅ Tanlandi: <b>${it.name}</b>`);
+    await send(
+      chat_id,
+      `📌 <b>${it.name}</b>\n\n🔢 Bajarilgan hajmni yozing (${it.unit ? it.unit + " " : ""}masalan 25 yoki 12.5):`,
+      { inline_keyboard: [[{ text: "↩️ Bekor qilish", callback_data: "dr:cancel" }]] }
+    );
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data === "dr:skip") {
+    session.data = { ...(session.data ?? {}), dr: { ...(session.data?.dr ?? {}), _pending: "none" } };
+    await saveSession(session);
+    try { await editText(chat_id, message_id, "✅ O'tkazib yuborildi"); } catch { /* eski xabar */ }
+    await drShowSummary(session, chat_id);
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data === "dr:impsave") {
+    try { await editText(chat_id, message_id, "⏳ Saqlanmoqda..."); } catch { /* eski xabar */ }
+    await drSaveImport(session, chat_id, message_id);
+    await answerCb(cb.id, "Saqlandi");
+    return true;
+  }
+  if (data === "dr:confirm") {
+    try { await editText(chat_id, message_id, "⏳ Saqlanmoqda..."); } catch { /* eski xabar */ }
+    await drSave(session, chat_id, message_id);
+    await answerCb(cb.id, "Saqlandi");
+    return true;
+  }
+  if (data === "dr:cancel") {
+    session.flow = "dr";
+    session.step = "menu";
+    session.data = { ...(session.data ?? {}), dr: {} };
+    await saveSession(session);
+    try { await editText(chat_id, message_id, "↩️ Bekor qilindi."); } catch { /* eski xabar */ }
+    await send(chat_id, "📋 Kunlik hisobot bekor qilindi.", drMenu());
+    await answerCb(cb.id);
+    return true;
+  }
+  return false;
+}
+
+// Xulosa kartasi
+async function drShowSummary(session: Session, chat_id: number) {
+  const d = session.data?.dr ?? {};
+  const lines = [
+    "📋 <b>Hisobot xulosasi:</b>",
+    `📌 ${d.name ?? ""}${d.unit ? ` (${d.unit})` : ""}`,
+    `🔢 Hajm: <b>${Number(d.qty) || 0}</b>${d.unit ? " " + d.unit : ""}`,
+  ];
+  if (d.brigade_name) lines.push(`👥 Brigada: ${d.brigade_name}`);
+  if (d.workers_count) lines.push(`🧑\u200d🤝\u200d🧑 Ishchilar: ${d.workers_count} ishchi`);
+  if (d.equipment_name) lines.push(`🚜 Texnika: ${d.equipment_name}${d.equipment_hours ? ` · ${d.equipment_hours} soat` : ""}`);
+  if (d.issues) lines.push(`⚠️ Muammo: ${d.issues}`);
+  if (d.note) lines.push(`📝 Izoh: ${d.note}`);
+  if (d.photo_url) lines.push(`🖼 Rasm: ✓`);
+  lines.push("");
+  lines.push("Qo'shimcha ma'lumot qo'shish yoki tasdiqlash:");
+  await send(chat_id, lines.join("\n"), {
+    inline_keyboard: [
+      [{ text: "👥 Brigada/ishchilar", callback_data: "dr:field:brigade" }],
+      [{ text: "🚜 Texnika", callback_data: "dr:field:equipment" }],
+      [{ text: "⚠️ Muammo", callback_data: "dr:field:issues" }],
+      [{ text: "📝 Izoh", callback_data: "dr:field:note" }],
+      [{ text: "🖼 Rasm", callback_data: "dr:field:photo" }],
+      [{ text: "✅ Tasdiqlash", callback_data: "dr:confirm" }],
+      [{ text: "↩️ Bekor qilish", callback_data: "dr:cancel" }],
+    ],
+  });
+}
+
+// Texnika/brigada/muammo — field so'rash
+function drHandleField(session: Session, cb: any, field: string): Promise<boolean> {
+  const chat_id = cb.message?.chat?.id ?? session.chat_id;
+  const message_id = cb.message?.message_id;
+  const prompts: Record<string, string> = {
+    brigade: "👥 <b>Brigada / ishchilar</b>\n\nBrigada nomi va ishchilar sonini yozing.\nMasalan: «Brigada 1, 8 ishchi»",
+    equipment: "🚜 <b>Texnika</b>\n\nIshlatilgan texnika nomi va soatini yozing.\nMasalan: «Ekskavator 6 soat»",
+    issues: "⚠️ <b>Muammo</b>\n\nBugungi muammo/qiyinchiliklarni yozing (yoki ↩️ o'tkazib yuboring):",
+    note: "📝 <b>Izoh</b>\n\nQo'shimcha izoh yozing (yoki ↩️ o'tkazib yuboring):",
+    photo: "🖼 <b>Rasm</b>\n\nIsh joyining rasmini yuboring (yoki ↩️ o'tkazib yuboring):",
+  };
+  return (async () => {
+    session.flow = "dr";
+    session.step = `input:${field}`;
+    session.data = { ...(session.data ?? {}), dr: { ...(session.data?.dr ?? {}), _pending: field } };
+    await saveSession(session);
+    if (message_id) await editText(chat_id, message_id, prompts[field] ?? field);
+    else await send(chat_id, prompts[field] ?? field);
+    await send(chat_id, "Yozing:", {
+      inline_keyboard: [[{ text: "↩️ O'tkazib yuborish", callback_data: "dr:skip" }, { text: "↩️ Bekor qilish", callback_data: "dr:cancel" }]],
+    });
+    await answerCb(cb.id);
+    return true;
+  })();
+}
+
+// Matn kiritish — dr oqimida
+async function drHandleText(session: Session, chat_id: number, text: string): Promise<boolean> {
+  const d = session.data?.dr ?? {};
+  const pending = d._pending ?? null;
+  if (!pending || pending === "none") return false;
+  let field = pending;
+  if (pending === "qty") {
+    const v = parseFloat(String(text).replace(",", "."));
+    if (!Number.isFinite(v) || v < 0) {
+      await send(chat_id, "❌ Iltimos, son kiriting (masalan 25 yoki 12.5):");
+      return true;
+    }
+    d.qty = v;
+    d._pending = "none";
+    session.flow = "dr";
+    session.step = "summary";
+    session.data = { ...(session.data ?? {}), dr: d };
+    await saveSession(session);
+    await drShowSummary(session, chat_id);
+    return true;
+  }
+  if (field === "brigade") {
+    const t = String(text).trim();
+    const m = t.match(/(\d+)\s*(ishchi|kishi|nafar|odam)/i);
+    const name = t.replace(/[,;·]?\s*\d+\s*(ishchi|kishi|nafar|odam)\s*/i, "").trim();
+    d.brigade_name = name || (m ? null : t) || null;
+    if (m) d.workers_count = parseInt(m[1], 10);
+    else if (/^\d+$/.test(t)) { d.workers_count = parseInt(t, 10); d.brigade_name = null; }
+  } else if (field === "equipment") {
+
+    const t = String(text).trim();
+    const hm = t.match(/([\d.,]+)\s*(soat|h|hr)/i);
+    d.equipment_name = t;
+    if (hm) d.equipment_hours = parseFloat(hm[1].replace(",", "."));
+  } else if (field === "issues") {
+    d.issues = text.trim();
+  } else if (field === "note") {
+    d.note = text.trim();
+  } else if (field === "photo") {
+    d.note = text.trim();
+  }
+  d._pending = "none";
+  session.flow = "dr";
+  session.step = "summary";
+  session.data = { ...(session.data ?? {}), dr: d };
+  await saveSession(session);
+  await send(chat_id, "✅ Qabul qilindi.");
+  await drShowSummary(session, chat_id);
+  return true;
+}
+
+
+/** Salyarka / DPR / HR kunlik PDF hisobotlari. true qaytarsa — javob yuborildi. */
+async function sendSpecialReport(chat_id: number, question: string, date: string): Promise<boolean> {
+  const kind = detectReportKind(question);
+  if (kind === "cash") return false;
+  if (kind === "dpr") {
+    const rep = await buildDprDayPdf(date).catch((e) => { console.error("dpr pdf", e); return null; });
+    if (!rep) {
+      await send(chat_id, "⚠️ DPR jadvalini o'qib bo'lmadi, PDF tayyorlanmadi. Birozdan keyin qayta so'rang.");
+      return true;
+    }
+    const top = rep.byWork.slice(0, 5).map(([w, q, u]) => `• ${w}: <b>${(Math.round(q * 100) / 100).toLocaleString("ru-RU")} ${u}</b>`).join("\n");
+    await nkSendPdf(chat_id, rep.bytes, `PV_Olga_DPR_${date}.pdf`,
+      `📄 <b>${date} DPR hisoboti</b>\n📝 Yozuvlar: <b>${rep.count}</b>\n${top || "Bu kunda yozuv yo'q."}`);
+    return true;
+  }
+  if (kind === "hr") {
+    const rep = await buildHrDayPdf(date).catch((e) => { console.error("hr pdf", e); return null; });
+    if (!rep) {
+      await send(chat_id, "⚠️ HR jadvalini o'qib bo'lmadi, PDF tayyorlanmadi. Birozdan keyin qayta so'rang.");
+      return true;
+    }
+    await nkSendPdf(chat_id, rep.bytes, `PV_Olga_HR_${date}.pdf`,
+      `👥 <b>${date} HR hisoboti</b>\n✅ Ishda: <b>${rep.present}</b>\n❌ Kelmadi: <b>${rep.absent}</b>\n🆕 Ishga qabul: <b>${rep.hired}</b>\n🚪 Ishdan chiqdi: <b>${rep.left}</b>`);
+    return true;
+  }
+  const rep = await buildFuelDayPdf(date).catch((e) => { console.error("fuel pdf", e); return null; });
+  if (!rep) {
+    await send(chat_id, "⚠️ Salyarka jadvalini o'qib bo'lmadi, PDF tayyorlanmadi. Birozdan keyin qayta so'rang.");
+    return true;
+  }
+  const f = (n: number) => (Math.round(n * 10) / 10).toLocaleString("ru-RU").replace(/[\s\u00a0\u202f]/g, " ");
+  await nkSendPdf(chat_id, rep.bytes, `PV_Olga_salyarka_${date}.pdf`,
+    `⛽ <b>${date} salyarka hisoboti</b>\n📥 Kirim: <b>${f(rep.inLit)} l</b>\n📤 Sarf: <b>${f(rep.outLit)} l</b>\n🛢 Kun oxiri qoldiq: <b>${f(rep.stock)} l</b>`);
+  return true;
 }

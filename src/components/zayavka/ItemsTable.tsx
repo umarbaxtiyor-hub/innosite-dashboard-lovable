@@ -45,12 +45,14 @@ export function ItemsTable({
   const [history, setHistory] = useState<ReceiptRow[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [query, setQuery] = useState("");
-  const [searchOpen, setSearchOpen] = useState(false);
 
   const visibleRows = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return rows;
-    return rows.filter((r) => (r.name ?? "").toLowerCase().includes(q) || (r.unit ?? "").toLowerCase().includes(q));
+    return rows.filter((r) => {
+      const text = [r.name, r.unit, (r as any).code, (r as any).description].filter(Boolean).join(" ").toLowerCase();
+      return text.includes(q);
+    });
   }, [rows, query]);
 
   useEffect(() => {
@@ -80,6 +82,22 @@ export function ItemsTable({
               unit_price: Number(r.unit_price || 0),
               total: Number(r.total_value || Number(r.qty_done) * Number(r.unit_price) || 0),
               note: r.brigade_name,
+            })));
+          }
+        } else if (actionRow.kind === "ustalar") {
+          const { data } = await supabase
+            .from("daily_report_lines")
+            .select("id,created_at,qty_done,unit_price,brigade_name,workers_count,equipment_name,zayavka_id")
+            .in("zayavka_id", relatedIds)
+            .order("created_at", { ascending: false });
+          if (!cancelled) {
+            setHistory((data ?? []).map((r: any) => ({
+              id: r.id,
+              date: (r.created_at ?? "").slice(0, 10),
+              qty: Number(r.qty_done || 0),
+              unit_price: Number(r.unit_price || 0),
+              total: Number(r.qty_done || 0) * Number(r.unit_price || 0),
+              note: [r.brigade_name, r.equipment_name].filter(Boolean).join(" · "),
             })));
           }
         } else {
@@ -158,25 +176,23 @@ export function ItemsTable({
             {title ?? "Ro'yxat"}
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <Button size="icon" variant="ghost" className="h-7 w-7" title="Qidirish" onClick={() => setSearchOpen((v) => !v)}>
-              <Search className="h-3.5 w-3.5" />
-            </Button>
             <div className="text-xs text-muted-foreground">
               Jami: <span className="font-semibold text-foreground tabular-nums">{fmtCompact(grandTotal)}</span>
             </div>
           </div>
         </div>
-        {searchOpen && (
-          <div className="px-3 py-2 border-b border-border/70 bg-muted/30">
+        <div className="px-3 py-2 border-b border-border/70 bg-muted/30">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
-              autoFocus
-              placeholder="Nom yoki birlik bo'yicha qidirish…"
+              placeholder="Nomi, kodi yoki izohi bo'yicha qidirish…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              className="h-8 text-sm"
+              className="h-8 pl-8 text-sm"
             />
           </div>
-        )}
+        </div>
+
 
         <ul className="divide-y divide-border/60">
           {visibleRows.map((r, idx) => {
@@ -269,7 +285,7 @@ export function ItemsTable({
           <DialogHeader>
             <DialogTitle className="truncate">{actionRow?.name}</DialogTitle>
             <DialogDescription>
-              {actionRow?.kind === "work" ? "Bajarilgan ishlar tarixi" : "Qabul qilingan materiallar tarixi"}
+              {actionRow?.kind === "work" ? "Bajarilgan ishlar tarixi" : actionRow?.kind === "ustalar" ? "Kunlik hisobot tarixi" : "Qabul qilingan materiallar tarixi"}
             </DialogDescription>
           </DialogHeader>
 

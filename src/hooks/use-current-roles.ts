@@ -1,15 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
 export function useCurrentRoles() {
   const [roles, setRoles] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const userIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let active = true;
-    async function loadRoles(userId?: string | null) {
-      if (active) setLoading(true);
+    async function loadRoles(userId?: string | null, options?: { showLoading?: boolean }) {
+      if (active && options?.showLoading !== false) setLoading(true);
       const uid = userId ?? (await supabase.auth.getSession()).data.session?.user?.id ?? null;
+      userIdRef.current = uid;
       if (!uid) {
         if (active) { setRoles([]); setLoading(false); }
         return;
@@ -21,9 +23,12 @@ export function useCurrentRoles() {
       }
     }
 
-    void loadRoles();
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      window.setTimeout(() => void loadRoles(session?.user?.id ?? null), 0);
+    void loadRoles(undefined, { showLoading: true });
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT") return;
+      const nextUserId = session?.user?.id ?? null;
+      if (event === "SIGNED_IN" && nextUserId === userIdRef.current) return;
+      window.setTimeout(() => void loadRoles(nextUserId, { showLoading: event === "SIGNED_OUT" }), 0);
     });
 
     return () => {

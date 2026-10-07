@@ -1,0 +1,1 @@
+REVOKE ALL ON FUNCTION public.enqueue_sheet_sync() FROM PUBLIC, anon, authenticated;

@@ -1,11 +1,21 @@
 import { useRef, useState } from "react";
-import { Upload, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
+import { Upload, Loader2, CheckCircle2, AlertCircle, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { useServerFn } from "@tanstack/react-start";
 import { normalizeZayavkaRows } from "@/lib/zayavka-excel-ai.functions";
+import templateAsset from "@/assets/innosite-smeta-shablon.xlsx.asset.json";
+
+const TEMPLATE_KEYS = new Set(["tur", "nomi", "birlik", "miqdor", "narx", "izoh"]);
+function isTemplateRows(rows: any[]): boolean {
+  if (!rows.length) return false;
+  const keys = Object.keys(rows[0] ?? {}).map((k) => k.toLowerCase().trim());
+  // template if at least tur+nomi+birlik+miqdor exist as exact keys
+  const required = ["tur", "nomi", "birlik", "miqdor"];
+  return required.every((r) => keys.includes(r)) && keys.every((k) => TEMPLATE_KEYS.has(k) || k === "");
+}
 
 type ParsedRow = {
   kind: "material" | "work";
@@ -188,31 +198,40 @@ export function ExcelUploadCard({ projectId, onDone, compact }: { projectId: str
         return;
       }
 
-      // AI doim ishlatiladi (backend)
+      // 1) TEZ YO'L: Innosite shabloni bo'lsa AI ishlatmasdan to'g'ridan-to'g'ri parse qilamiz
+      if (isTemplateRows(rawRows)) {
+        const { items, skipped } = parseLocal(rawRows);
+        await insertItems(items, false, skipped);
+        return;
+      }
 
-      // AI normalizatsiya
+      // 2) AI normalizatsiya — parallel chunks
       setAiBusy(true);
-      // Juda katta bo'lsa, qismlarga bo'lib yuboramiz (har 80 qator)
       const chunkSize = 80;
       const chunks: any[][] = [];
       for (let i = 0; i < rawRows.length; i += chunkSize) chunks.push(rawRows.slice(i, i + chunkSize));
+      // parallel — lekin katta fayllarda 4 tadan cheklaymiz
+      const CONCURRENCY = 4;
       const allItems: ParsedRow[] = [];
-      for (const ch of chunks) {
-        const res = await aiNormalize({ data: { rows: ch } });
-        const items = (res?.items ?? []) as any[];
-        for (const it of items) {
-          const kind = it?.kind === "work" ? "work" : it?.kind === "material" ? "material" : null;
-          if (!kind || !it?.name) continue;
-          allItems.push({
-            kind,
-            name: String(it.name).trim(),
-            unit: String(it.unit ?? "dona").trim() || "dona",
-            qty: Number(it.qty) || 0,
-            unit_price: Number(it.unit_price) || 0,
-            notes: it.notes ?? null,
-            master_id: it.master_id ?? null,
-            off_plan: !!it.off_plan,
-          });
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const batch = chunks.slice(i, i + CONCURRENCY);
+        const results = await Promise.all(batch.map((ch) => aiNormalize({ data: { rows: ch } })));
+        for (const res of results) {
+          const items = (res?.items ?? []) as any[];
+          for (const it of items) {
+            const kind = it?.kind === "work" ? "work" : it?.kind === "material" ? "material" : null;
+            if (!kind || !it?.name) continue;
+            allItems.push({
+              kind,
+              name: String(it.name).trim(),
+              unit: String(it.unit ?? "dona").trim() || "dona",
+              qty: Number(it.qty) || 0,
+              unit_price: Number(it.unit_price) || 0,
+              notes: it.notes ?? null,
+              master_id: it.master_id ?? null,
+              off_plan: !!it.off_plan,
+            });
+          }
         }
       }
       await insertItems(allItems, true, Math.max(0, rawRows.length - allItems.length));
@@ -240,6 +259,11 @@ export function ExcelUploadCard({ projectId, onDone, compact }: { projectId: str
             if (f) handleFile(f);
           }}
         />
+        <Button size="sm" variant="outline" asChild>
+          <a href={templateAsset.url} download="innosite-smeta-shablon.xlsx">
+            <Download className="mr-1 h-4 w-4" /> Shablon
+          </a>
+        </Button>
         <Button size="sm" disabled={loading} onClick={() => inputRef.current?.click()}>
           {loading ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : <Upload className="mr-1 h-4 w-4" />}
           {loading ? "Yuklanmoqda..." : "Excel yuklash"}
@@ -254,7 +278,7 @@ export function ExcelUploadCard({ projectId, onDone, compact }: { projectId: str
         <div>
           <div className="text-sm font-medium">Excel orqali reja yuklash</div>
           <div className="text-xs text-muted-foreground mt-0.5">
-            Har qanday formatdagi Excelni yuklang — tizim o'zi material va ish turlariga ajratadi.
+            Innosite shablonini yuklab oling — tez va aniq. Yoki istalgan Excel yuklang, AI o'zi tartibga soladi.
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -268,6 +292,11 @@ export function ExcelUploadCard({ projectId, onDone, compact }: { projectId: str
               if (f) handleFile(f);
             }}
           />
+          <Button size="sm" variant="outline" asChild>
+            <a href={templateAsset.url} download="innosite-smeta-shablon.xlsx">
+              <Download className="mr-1 h-4 w-4" /> Shablon
+            </a>
+          </Button>
           <Button size="sm" disabled={loading} onClick={() => inputRef.current?.click()}>
             {loading ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : <Upload className="mr-1 h-4 w-4" />}
             {busy || aiBusy ? "Yuklanmoqda..." : "Excel yuklash"}

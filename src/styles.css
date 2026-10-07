@@ -281,3 +281,8 @@
 .animate-slow-blink {
   animation: slow-blink 2.2s ease-in-out infinite;
 }
+
+/* Pull-to-refresh: native brauzer refresh o'rniga bizning handler ishlashi uchun */
+html, body {
+  overscroll-behavior-y: contain;
+}

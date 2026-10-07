@@ -80,7 +80,7 @@ function VariationsPage() {
           <TabsList className="flex w-full max-w-full overflow-x-auto no-scrollbar h-auto justify-start">
             <TabsTrigger value="material">📦 Materiallar</TabsTrigger>
             <TabsTrigger value="work">🔨 Ish turlari</TabsTrigger>
-            <TabsTrigger value="equipment">🛠 Yordamchi</TabsTrigger>
+            <TabsTrigger value="equipment">🛠 Operatsion</TabsTrigger>
           </TabsList>
 
           {(["material", "work", "equipment"] as const).map((k) => (

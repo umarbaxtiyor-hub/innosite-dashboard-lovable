@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -13,6 +13,7 @@ import { useActiveProject } from "@/lib/project-context";
 import { useBoq, fmtUZS } from "@/lib/queries";
 import { ProjectKpiGrid } from "@/components/dashboard/ProjectKpiGrid";
 import { LockedOverlay } from "@/components/LockedOverlay";
+
 
 
 
@@ -32,8 +33,22 @@ const CHART_COLORS = [
   "var(--chart-5)", "var(--chart-6)", "var(--chart-7)", "var(--chart-8)",
 ];
 
+async function fetchAllRows<T>(buildQuery: (from: number, to: number) => any, pageSize = 1000): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += pageSize) {
+    const to = from + pageSize - 1;
+    const { data, error } = await buildQuery(from, to);
+    if (error) throw error;
+    const rows = (data ?? []) as T[];
+    all.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return all;
+}
+
 function DashboardPage() {
   const { activeProjectId, activeProject } = useActiveProject();
+  const qc = useQueryClient();
 
   const { data: allProjects = [] } = useQuery({
     queryKey: ["projects-with-firm"],
@@ -56,54 +71,63 @@ function DashboardPage() {
     staleTime: 2 * 60_000,
     gcTime: 10 * 60_000,
     queryFn: async () => {
-      const exQ = supabase.from("expenses").select("category,amount,project_id");
-      const matQ = supabase.from("material_receipts").select("total_price,qty,unit_price,project_id");
-      const wpQ = supabase.from("work_progress").select("total_value,qty_done,unit_price,project_id");
-      const bpQ = supabase.from("brigade_payments").select("amount,kind,project_id");
-      const offQ = supabase.from("project_zayavka").select("total,paid_amount,qty,qty_received,unit_price,project_id,off_plan").eq("off_plan", true);
-
       const [ex, mat, wp, bp, off] = await Promise.all([
-        activeProjectId ? exQ.eq("project_id", activeProjectId) : exQ,
-        activeProjectId ? matQ.eq("project_id", activeProjectId) : matQ,
-        activeProjectId ? wpQ.eq("project_id", activeProjectId) : wpQ,
-        activeProjectId ? bpQ.eq("project_id", activeProjectId) : bpQ,
-        activeProjectId ? offQ.eq("project_id", activeProjectId) : offQ,
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("expenses").select("category,amount,project_id").or("source.is.null,and(source.neq.web_boq,source.neq.web_boq_mat),and(source.eq.web_boq,kind.in.(boq_work,ustalar))");
+          return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("material_receipts").select("total_price,qty,unit_price,project_id");
+          return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("work_progress").select("total_value,qty_done,unit_price,project_id");
+          return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("brigade_payments").select("amount,kind,project_id");
+          return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(from, to);
+        }),
+        fetchAllRows<any>((from, to) => {
+          const q = supabase.from("project_zayavka").select("total,paid_amount,qty,qty_received,unit_price,project_id,off_plan").eq("off_plan", true);
+          return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(from, to);
+        }),
       ]);
 
       const m = new Map<string, number>();
       const add = (k: string, v: number) => { if (v > 0) m.set(k, (m.get(k) ?? 0) + v); };
 
-      for (const r of (ex.data ?? []) as any[]) {
-        const cat = r.category || "Boshqa";
-        add(cat, Number(r.amount) || 0);
+      // Xodimlarga tegishli xarajat kategoriyalari — Xodimlar guruhiga birlashtiramiz
+      const isSalaryCat = (c: string) => {
+        const s = c.toLowerCase();
+        return s.includes("oylik") || s.includes("ish haqi") || s.includes("maosh");
+      };
+      for (const r of ex) {
+        const cat = String(r.category || "Boshqa");
+        const key = isSalaryCat(cat) ? "Xodimlar" : cat;
+        add(key, Number(r.amount) || 0);
       }
-      const matSum = (mat.data ?? []).reduce(
+      const matSum = mat.reduce(
         (s: number, r: any) => s + (Number(r.total_price) || Number(r.qty) * Number(r.unit_price) || 0), 0,
       );
       add("Material (BOQ)", matSum);
-      const wpSum = (wp.data ?? []).reduce(
+      const wpSum = wp.reduce(
         (s: number, r: any) => s + (Number(r.total_value) || Number(r.qty_done) * Number(r.unit_price) || 0), 0,
       );
       add("Ish (BOQ)", wpSum);
-      const bpSum = (bp.data ?? []).reduce((s: number, r: any) => s + Number(r.amount || 0), 0);
+      const bpSum = bp.reduce((s: number, r: any) => s + Number(r.amount || 0), 0);
       add("Xodimlar", bpSum);
-      const offSum = (off.data ?? []).reduce((s: number, r: any) => {
+      const offSum = off.reduce((s: number, r: any) => {
         const paid = Number(r.paid_amount) || 0;
         const recv = (Number(r.qty_received) || 0) * (Number(r.unit_price) || 0);
         return s + Math.max(paid, recv);
       }, 0);
-      add("Qo'shimcha (BOQ)", offSum);
+      add("Yordamchi (BOQ)", offSum);
 
-      const result = Array.from(m, ([name, value]) => ({ name, value }));
-      const ORDER = [
-        "Material (BOQ)", "Ish (BOQ)", "Qo'shimcha (BOQ)",
-        "Bozorlik", "Transport", "Yordamchi", "Xodimlar", "Boshqa",
-      ];
-      const ordered = ORDER.map((name) => {
-        const found = result.find((r) => r.name === name);
-        return { name, value: found?.value ?? 0 };
-      }).filter((r) => r.value > 0);
-      return ordered;
+      // Barcha haqiqiy kategoriyalarni ko'rsatamiz, katta summadan boshlab
+      return Array.from(m, ([name, value]) => ({ name, value }))
+        .filter((r) => r.value > 0)
+        .sort((a, b) => b.value - a.value);
     },
   });
 
@@ -117,8 +141,7 @@ function DashboardPage() {
   // Reja vs Fakt — smeta (project_zayavka master) bo'yicha. boq_items bo'sh bo'lganda ham ishlaydi.
   const { data: plannedVsActual = [] } = useQuery({
     queryKey: ["dashboard-plan-vs-fact", activeProjectId ?? "all"],
-    staleTime: 60_000,
-    refetchInterval: 30_000,
+    staleTime: 5 * 60_000,
     queryFn: async () => {
       const q = supabase
         .from("project_zayavka")
@@ -126,7 +149,7 @@ function DashboardPage() {
         .eq("off_plan", false)
         .is("zayavka_no", null)
         .is("parent_id", null);
-      const { data } = activeProjectId ? await q.eq("project_id", activeProjectId) : await q;
+        const { data } = activeProjectId ? await q.eq("project_id", activeProjectId) : await q;
       const labels: Record<string, string> = { material: "Material", work: "Ishlar", equipment: "Uskuna" };
       const m = new Map<string, { planned: number; actual: number }>();
       (data ?? []).forEach((r: any) => {
@@ -166,14 +189,16 @@ function DashboardPage() {
     queryFn: async () => {
       const from = new Date(); from.setDate(from.getDate() - 30);
       const fromStr = from.toISOString().slice(0, 10);
-      const q = supabase.from("expenses").select("amount,expense_date").gte("expense_date", fromStr);
-      const { data } = activeProjectId ? await q.eq("project_id", activeProjectId) : await q;
+      const data = await fetchAllRows<any>((fromIdx, toIdx) => {
+        const q = supabase.from("expenses").select("amount,expense_date").or("source.is.null,and(source.neq.web_boq,source.neq.web_boq_mat),and(source.eq.web_boq,kind.in.(boq_work,ustalar))").gte("expense_date", fromStr);
+        return (activeProjectId ? q.eq("project_id", activeProjectId) : q).range(fromIdx, toIdx);
+      });
       const m = new Map<string, number>();
       for (let i = 0; i < 30; i++) {
         const d = new Date(); d.setDate(d.getDate() - (29 - i));
         m.set(d.toISOString().slice(5, 10), 0);
       }
-      (data ?? []).forEach((r: any) => {
+      data.forEach((r: any) => {
         const k = String(r.expense_date ?? "").slice(5, 10);
         if (m.has(k)) m.set(k, (m.get(k) ?? 0) + Number(r.amount ?? 0));
       });
@@ -183,9 +208,11 @@ function DashboardPage() {
 
   const chartCardCls = "relative overflow-hidden rounded-xl border-2 border-[var(--card-frame)] bg-card p-3 shadow-sm";
 
+
   return (
     <div className="pastel-canvas flex flex-col gap-3 p-3 sm:p-4 lg:p-6 lg:max-w-[1600px] lg:mx-auto w-full">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
+
         {/* Chap: hero + KPI vertikal */}
         <div className="lg:col-span-7">
           <ProjectKpiGrid projectId={activeProjectId} activeName={activeProject?.name ?? null} />

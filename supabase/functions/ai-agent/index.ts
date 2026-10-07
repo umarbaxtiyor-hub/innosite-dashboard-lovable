@@ -1,65 +1,183 @@
 // AI agent for QurilishNazorat. Uses Lovable AI gateway with tool calling.
-// Tools query Supabase data via service role (read-only) to keep the agent honest.
+// Xavfsizlik: foydalanuvchi so'rovlari uning JWT si bilan (RLS amal qiladi) o'qiladi;
+// service role faqat ichki server (Telegram bot) uchun, kalit aniq tengligi bilan.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { ORG_ONLY_TOOLS, selectToolNames, recentUserText } from "./tool-select.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+// CORS himoya emas — asosiy himoya pastdagi JWT + rol + loyiha doirasi tekshiruvi.
+const ALLOWED_ORIGINS = ["https://innosite.io", "https://www.innosite.io", "https://innosite.lovable.app"];
+const baseCors: Record<string, string> = {
+  "Vary": "Origin",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
+const corsFor = (req: Request) => {
+  const origin = req.headers.get("origin") ?? "";
+  return { ...baseCors, "Access-Control-Allow-Origin": ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0] };
+};
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
-const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-4-5";
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
+const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY")!;
+const AI_MODEL = Deno.env.get("AI_MODEL") ?? "google/gemini-3.7-flash";
+const admin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+
+// Har so'rov uchun alohida kontekst (parallel so'rovlar o'rtasida holat ulashilmaydi).
+// allowedProjects: null = butun tashkilot; massiv = faqat shu loyihalar.
+type ToolCtx = { sb: any; allowedProjects: string[] | null };
+
+// Real app_role modeli (public.user_roles). Boshqa rollar → 403.
+// Biznes qoidasi: PM ham barcha loyihalarni ko'radi (CEO kabi).
+const ORG_WIDE_ROLES = ["admin", "ceo", "direktor", "finans", "buxgalter", "accountant", "pm", "project_manager"];
+const PROJECT_ROLES: string[] = [];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_TOOL_CALLS_PER_TURN = 8;
+const clampLimit = (v: unknown, def: number) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : def; };
+// Jami summalar uchun: server 1000 qatorda kesadi, shuning uchun sahifalab hammasini o'qiymiz.
+async function allRows(build: (from: number, to: number) => any): Promise<{ data: any[] }> {
+  const out: any[] = [];
+  for (let from = 0; from < 200_000; from += 1000) {
+    const { data, error } = await build(from, from + 999);
+    if (error) throw error;
+    out.push(...(data ?? []));
+    if (!data || data.length < 1000) break;
+  }
+  return { data: out };
+}
+function safeEq(a: string, b: string) {
+  if (!a || !b || a.length !== b.length) return false;
+  let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+// Kalit rotatsiyasidan keyin env bilan mos kelmasligi mumkin: role=service_role claim + faqat
+// service role o'qiy oladigan (policy'siz) jadvaldan haqiqiy qator qaytishi bilan tasdiqlanadi.
+// Oddiy foydalanuvchi/anon JWT RLS tufayli bo'sh natija oladi → ichki hisoblanmaydi.
+async function isServiceRoleJwt(jwt: string): Promise<boolean> {
+  try {
+    const part = jwt.split(".")[1];
+    if (!part) return false;
+    const payload = JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/")));
+    if (payload?.role !== "service_role") return false;
+    const probe = createClient(SUPABASE_URL, jwt, { auth: { persistSession: false } });
+    const { data, error } = await probe.from("internal_secrets").select("key").limit(1);
+    return !error && Array.isArray(data) && data.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 const tools = [
-  { type: "function", function: { name: "list_projects", description: "Tizimdagi barcha loyihalar (id, nom, kod, status, byudjet, sanalar, firma).", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "list_firms", description: "Barcha firmalar ro'yxati.", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_project", description: "Bitta loyiha to'liq ma'lumoti (sanalar, byudjet, firma, status).", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_master_zayavka", description: "Loyiha master zayavkasi (material/ish reja qatorlari, qabul/qoldi).", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_zayavka_workflow", description: "Loyiha zayavkalari workflow holati. status: pending_pm/approved/rejected/in_purchase/delivered/invoiced/paid.", parameters: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_summary", description: "Loyihaning umumiy moliyaviy holati: byudjet, fakt, kirim/chiqim (Naxd/Bank), kassa qoldig'i, material/ish summalari, bajarilish %, deadline.", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_warehouse_receipts", description: "Loyihaga kelgan oxirgi nakladnoylar (material qabuli).", parameters: { type: "object", properties: { project_id: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_expenses", description: "Loyiha xarajatlari. Filterlar: kategoriya, payment_method (Naqd/Bank/Karta), sana oraliqi.", parameters: { type: "object", properties: { project_id: { type: "string" }, category: { type: "string" }, payment_method: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_incomes", description: "Loyiha kirimi (brigade_payments dan kind != 'avans'). Manba (Naqd/Bank/Karta) bo'yicha taqsimot.", parameters: { type: "object", properties: { project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_work_progress", description: "Loyiha bo'yicha bajarilgan ishlar (turi, hajmi, summasi, brigada, sana).", parameters: { type: "object", properties: { project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_boq", description: "Loyiha BOQ (smeta) qatorlari va har birining bajarilish %, fakt vs reja.", parameters: { type: "object", properties: { project_id: { type: "string" }, category: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_variations", description: "Loyiha bo'yicha variations (qo'shimcha ish/o'zgartirishlar) ro'yxati va statuslari.", parameters: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "get_brigades", description: "Barcha brigadalar va ularning balansi (ishlangan − to'langan).", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_brigade_detail", description: "Bitta brigada to'liq: a'zolar, oxirgi to'lovlar, qilingan ishlar.", parameters: { type: "object", properties: { brigade_id: { type: "string" } }, required: ["brigade_id"] } } },
+  { type: "function", function: { name: "list_projects", description: "Loyihalar ro'yxati (id, nom, status, byudjet). Loyiha ID topish uchun.", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "list_firms", description: "Firmalar ro'yxati (faqat firma ID kerak bo'lsa).", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_project", description: "Bitta loyiha pasporti: sanalar, byudjet, firma, status. Pul uchun get_summary.", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_master_zayavka", description: "Loyiha reja qatorlari (material/ish): rejada, qabul qilingan, qoldi.", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_zayavka_workflow", description: "Zayavkalar tasdiq/xarid holati. status: pending_pm/approved/rejected/in_purchase/delivered/invoiced/paid.", parameters: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_summary", description: "ASOSIY loyiha moliyasi: kirim (Naqd/Bank), chiqim kategoriyalari, balans, shartnoma kirimi, bajarilish %, deadline. Jami/qoldiq savollariga shu.", parameters: { type: "object", properties: { project_id: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_warehouse_receipts", description: "Omborga kelgan nakladnoylar (material qabuli).", parameters: { type: "object", properties: { project_id: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_expenses", description: "Xarajat qatorlari (ro'yxat/qidiruv). Filter: kategoriya, payment_method, sana. Jami uchun get_summary.", parameters: { type: "object", properties: { project_id: { type: "string" }, category: { type: "string" }, payment_method: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_incomes", description: "Kirim qatorlari (ro'yxat): naqd/bank va shartnoma kirimi alohida.", parameters: { type: "object", properties: { project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_work_progress", description: "Bajarilgan ish yozuvlari (tur, hajm, summa, brigada, sana).", parameters: { type: "object", properties: { project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_boq", description: "BOQ/smeta qatorlari: reja vs fakt, bajarilish %.", parameters: { type: "object", properties: { project_id: { type: "string" }, category: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_variations", description: "Qo'shimcha ish/o'zgartirishlar (variations) va statuslari.", parameters: { type: "object", properties: { project_id: { type: "string" }, status: { type: "string" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "get_brigades", description: "Barcha brigadalar balansi (ishlangan − to'langan).", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_brigade_detail", description: "Bitta brigada: a'zolar, to'lovlar, ishlar.", parameters: { type: "object", properties: { brigade_id: { type: "string" } }, required: ["brigade_id"] } } },
   { type: "function", function: { name: "get_employees", description: "Xodimlar ro'yxati (lavozim, oylik, faollik).", parameters: { type: "object", properties: { firm_id: { type: "string" } } } } },
-  { type: "function", function: { name: "get_employee_payments", description: "Xodim oylik/avans to'lovlari. Filterlar: employee_id, project_id, sana.", parameters: { type: "object", properties: { employee_id: { type: "string" }, project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } } } } },
+  { type: "function", function: { name: "get_employee_payments", description: "Xodimlarga oylik/avans to'lovlari. Filter: employee_id, project_id, sana.", parameters: { type: "object", properties: { employee_id: { type: "string" }, project_id: { type: "string" }, since: { type: "string" }, until: { type: "string" }, limit: { type: "number" } } } } },
   { type: "function", function: { name: "get_suppliers", description: "Yetkazib beruvchilar va kontaktlari.", parameters: { type: "object", properties: { firm_id: { type: "string" } } } } },
   { type: "function", function: { name: "get_supplier_contracts", description: "Yetkazib beruvchilar bilan shartnomalar.", parameters: { type: "object", properties: { supplier_id: { type: "string" }, firm_id: { type: "string" } } } } },
-  { type: "function", function: { name: "search_master", description: "Master katalogdan material/ish nomi bo'yicha qidirish.", parameters: { type: "object", properties: { q: { type: "string" }, kind: { type: "string", enum: ["material", "work"] } }, required: ["q"] } } },
-  { type: "function", function: { name: "get_recent_activity", description: "Loyiha bo'yicha so'nggi aktivlik (yangi xarajat, kirim, ish, qabul, zayavka).", parameters: { type: "object", properties: { project_id: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
-  { type: "function", function: { name: "global_finance", description: "Butun tizim yoki firma kesimida moliya: kirim, chiqim (method bo'yicha), kassa qoldig'i, sof natija.", parameters: { type: "object", properties: { firm_id: { type: "string" } } } } },
+  { type: "function", function: { name: "search_master", description: "Master katalogda material/ish nomini qidirish.", parameters: { type: "object", properties: { q: { type: "string" }, kind: { type: "string", enum: ["material", "work"] } }, required: ["q"] } } },
+  { type: "function", function: { name: "get_recent_activity", description: "Loyihadagi so'nggi o'zgarishlar (xarajat, kirim, ish, qabul, zayavka).", parameters: { type: "object", properties: { project_id: { type: "string" }, limit: { type: "number" } }, required: ["project_id"] } } },
+  { type: "function", function: { name: "global_finance", description: "Butun tashkilot/firma moliyasi (loyihasiz savol): kirim, chiqim, kassa qoldig'i, sof pul oqimi.", parameters: { type: "object", properties: { firm_id: { type: "string" } } } } },
 ];
 
 const sum = (rows: any[] = [], k: string) => rows.reduce((a, r) => a + Number(r[k] || 0), 0);
 
-async function runTool(name: string, args: any): Promise<any> {
+// Shartnoma bo'yicha kirim — kassaga qo'shilmaydi (alohida ko'rsatiladi)
+const isContractIncome = (r: any) => /shartnoma|kontrak/i.test(String(r?.category ?? ""));
+
+// Yagona moliyaviy model: JURNAL — yagona manba.
+// Chiqim = material + ish + xodim (oylik) + usta (brigada) + boshqa xarajat.
+// Har bir yozuv faqat bitta kategoriyaga tushadi (takror sanash yo'q).
+// BOQ ga bog'langan xarajat expenses'ga source='web_boq' bo'lib mirror qilinadi —
+// u material/ish summasida sanaladi, shuning uchun bu yerda chiqarib tashlanadi.
+function finance({ exp, inc, mat, work, pay }: { exp?: any[]; inc?: any[]; mat?: any[]; work?: any[]; pay?: any[] }) {
+  const expenses = (exp ?? []).filter((r: any) => String(r.source ?? "") !== "web_boq");
+  const material = (mat ?? []).reduce((s, r: any) => s + (Number(r.total_price) || Number(r.qty) * Number(r.unit_price) || 0), 0);
+  const ish = (work ?? []).reduce((s, r: any) => s + (Number(r.total_value) || Number(r.qty_done) * Number(r.unit_price) || 0), 0);
+  const usta = sum(pay ?? [], "amount");
+  const isSalary = (r: any) => /oylik|ish haqi|maosh|xodim/i.test(String(r.category ?? ""));
+  const xodim = expenses.filter(isSalary).reduce((s, r: any) => s + Number(r.amount || 0), 0);
+  const boshqa = expenses.filter((r: any) => !isSalary(r)).reduce((s, r: any) => s + Number(r.amount || 0), 0);
+  const chiqim = material + ish + xodim + usta + boshqa;
+
+  const incomes = inc ?? [];
+  const kassaInc = incomes.filter((r: any) => !isContractIncome(r));
+  const kirim = sum(kassaInc, "amount");
+  const shartnomaKirim = sum(incomes.filter(isContractIncome), "amount");
+
+  const inNaqd = kassaInc.filter((r: any) => String(r.payment_method || "Naqd") === "Naqd").reduce((s, r: any) => s + Number(r.amount || 0), 0);
+  const inBank = kirim - inNaqd;
+  // Material/ish/usta to'lovlarida usul ko'rsatilmagan — naqd deb hisoblanadi
+  const outBank = expenses.filter((r: any) => /bank|karta/i.test(String(r.payment_method ?? ""))).reduce((s, r: any) => s + Number(r.amount || 0), 0);
+  const outNaqd = chiqim - outBank;
+
+  return {
+    kirim,
+    kirim_by_method: { Naqd: inNaqd, Bank: inBank },
+    shartnoma_kirim: shartnomaKirim,
+    chiqim,
+    chiqim_by_category: {
+      "Material": material,
+      "Ish": ish,
+      "Xodimlar (oylik)": xodim,
+      "Ustalar (brigada)": usta,
+      "Yordamchi/boshqa": boshqa,
+    },
+    chiqim_by_method: { Naqd: outNaqd, Bank: outBank },
+    balans: kirim - chiqim,
+    balans_naqd: inNaqd - outNaqd,
+    balans_bank: inBank - outBank,
+  };
+}
+
+async function runTool(name: string, rawArgs: any, ctx: ToolCtx): Promise<any> {
+  const { sb, allowedProjects } = ctx;
   try {
+    const args: any = rawArgs && typeof rawArgs === "object" ? { ...rawArgs } : {};
+    for (const k of ["project_id", "firm_id", "brigade_id", "employee_id", "supplier_id"]) {
+      if (args[k] != null && !UUID_RE.test(String(args[k]))) return { error: `${k} noto'g'ri` };
+    }
+    for (const k of ["since", "until"]) if (args[k] != null && !DATE_RE.test(String(args[k]))) delete args[k];
+    if (args.q != null) args.q = String(args.q).slice(0, 100).replace(/[%_,()]/g, " ");
+    for (const k of ["category", "payment_method", "status"]) if (args[k] != null) args[k] = String(args[k]).slice(0, 80);
+    // Loyiha doirasi (pm/project_manager) — kodda majburiy, promptga tayanilmaydi.
+    if (allowedProjects) {
+      if (ORG_ONLY_TOOLS.has(name)) return { error: "Bu ma'lumot sizning rolingiz uchun ruxsat etilmagan" };
+      if (name !== "list_projects" && !args.project_id) return { error: "Loyihani tanlang (project_id kerak)" };
+      if (args.project_id && !allowedProjects.includes(args.project_id)) return { error: "Bu loyiha sizga biriktirilmagan" };
+    }
     if (name === "list_projects") {
-      const { data } = await sb.from("projects").select("id,name,code,status,total_budget,start_date,end_date,firm_id").order("name");
+      let q = sb.from("projects").select("id,name,code,status,total_budget,start_date,end_date,firm_id").order("name").limit(200);
+      if (allowedProjects) q = q.in("id", allowedProjects.length ? allowedProjects : ["00000000-0000-0000-0000-000000000000"]);
+      const { data } = await q;
       return data;
     }
     if (name === "list_firms") {
-      const { data } = await sb.from("firms").select("id,name,inn,phone").order("name");
+      const { data } = await sb.from("firms").select("id,name,inn,phone").order("name").limit(100);
       return data;
     }
     if (name === "get_project") {
-      const { data } = await sb.from("projects").select("*").eq("id", args.project_id).maybeSingle();
+      const { data } = await sb.from("projects").select("id,name,code,status,total_budget,start_date,end_date,firm_id").eq("id", args.project_id).maybeSingle();
       return data;
     }
     if (name === "get_master_zayavka") {
       const { data } = await sb.from("project_zayavka")
         .select("id,kind,name,unit,qty,unit_price,total,status,workflow_status,paid_amount,supplier_name")
-        .eq("project_id", args.project_id).is("parent_id", null);
+        .eq("project_id", args.project_id).is("parent_id", null).limit(500);
       return data;
     }
     if (name === "get_zayavka_workflow") {
@@ -72,22 +190,17 @@ async function runTool(name: string, args: any): Promise<any> {
     }
     if (name === "get_summary") {
       const pid = args.project_id;
-      const [proj, boq, exp, mat, work, vars, inc] = await Promise.all([
+      const [proj, boq, exp, mat, work, vars, inc, pay] = await Promise.all([
         sb.from("projects").select("name,total_budget,start_date,end_date,status").eq("id", pid).maybeSingle(),
-        sb.from("boq_items").select("planned_cost,actual_cost,qty").eq("project_id", pid),
-        sb.from("expenses").select("amount,payment_method,expense_date,category").eq("project_id", pid),
-        sb.from("material_receipts").select("total_price").eq("project_id", pid),
-        sb.from("work_progress").select("total_value").eq("project_id", pid),
-        sb.from("project_zayavka").select("status,workflow_status").eq("project_id", pid),
-        sb.from("brigade_payments").select("amount,kind,source").eq("project_id", pid),
+        allRows((a, b) => sb.from("boq_items").select("planned_cost,actual_cost,qty").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("expenses").select("amount,payment_method,expense_date,category,source").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("material_receipts").select("total_price,qty,unit_price").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("work_progress").select("total_value,qty_done,unit_price").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("project_zayavka").select("status,workflow_status").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("incomes").select("amount,payment_method,category").eq("project_id", pid).order("id").range(a, b)),
+        allRows((a, b) => sb.from("brigade_payments").select("amount,kind").eq("project_id", pid).order("id").range(a, b)),
       ]);
-      const incomes = (inc.data ?? []).filter((r: any) => (r.kind ?? "").toLowerCase() !== "avans");
-      const byMethod = { Naqd: 0, Bank: 0, Karta: 0, Boshqa: 0 } as Record<string, number>;
-      for (const r of exp.data ?? []) { const m = String(r.payment_method || "Boshqa"); byMethod[m] = (byMethod[m] || 0) + Number(r.amount || 0); }
-      const inByKind: Record<string, number> = {};
-      for (const r of incomes) { const k = String(r.source || r.kind || "Boshqa"); inByKind[k] = (inByKind[k] || 0) + Number(r.amount || 0); }
-      const payIn = sum(incomes, "amount");
-      const totalOut = sum(exp.data ?? [], "amount");
+      const f = finance({ exp: exp.data, inc: inc.data, mat: mat.data, work: work.data, pay: pay.data });
       const today = new Date();
       const start = proj.data?.start_date ? new Date(proj.data.start_date) : null;
       const end = proj.data?.end_date ? new Date(proj.data.end_date) : null;
@@ -102,16 +215,9 @@ async function runTool(name: string, args: any): Promise<any> {
       const progressPct = planned > 0 ? (actual / planned) * 100 : 0;
       return {
         project: proj.data,
-        budget: proj.data?.total_budget ?? planned,
+        shartnoma_summasi: proj.data?.total_budget ?? planned,
+        ...f,
         boq_planned: planned,
-        boq_actual: actual,
-        materials: sum(mat.data ?? [], "total_price"),
-        work: sum(work.data ?? [], "total_value"),
-        expenses_total: totalOut,
-        expenses_by_method: byMethod,
-        income_total: payIn,
-        income_by_source: inByKind,
-        kassa_balance: payIn - totalOut,
         zayavka_pending: (vars.data ?? []).filter((v: any) => v.status === "pending").length,
         zayavka_approved: (vars.data ?? []).filter((v: any) => v.status === "approved").length,
         progress_pct: Math.round(progressPct * 10) / 10,
@@ -123,7 +229,7 @@ async function runTool(name: string, args: any): Promise<any> {
     if (name === "get_warehouse_receipts") {
       const { data } = await sb.from("material_receipts")
         .select("received_at,material_name,qty,unit,unit_price,total_price,supplier_name")
-        .eq("project_id", args.project_id).order("received_at", { ascending: false }).limit(args.limit ?? 30);
+        .eq("project_id", args.project_id).order("received_at", { ascending: false }).limit(clampLimit(args.limit, 30));
       return data;
     }
     if (name === "get_expenses") {
@@ -134,20 +240,30 @@ async function runTool(name: string, args: any): Promise<any> {
       if (args.payment_method) q = q.eq("payment_method", args.payment_method);
       if (args.since) q = q.gte("expense_date", args.since);
       if (args.until) q = q.lte("expense_date", args.until);
-      const { data } = await q.limit(args.limit ?? 100);
+      const { data } = await q.limit(clampLimit(args.limit, 100));
       return data;
     }
     if (name === "get_incomes") {
-      let q = sb.from("brigade_payments")
-        .select("payment_date,brigade_name,amount,kind,source,note")
-        .eq("project_id", args.project_id).neq("kind", "avans").order("payment_date", { ascending: false });
-      if (args.since) q = q.gte("payment_date", args.since);
-      if (args.until) q = q.lte("payment_date", args.until);
-      const { data } = await q.limit(args.limit ?? 100);
-      const total = sum(data ?? [], "amount");
-      const by: Record<string, number> = {};
-      for (const r of data ?? []) { const k = String(r.source || r.kind || "Boshqa"); by[k] = (by[k] || 0) + Number(r.amount || 0); }
-      return { total, by_source: by, items: data };
+      let q = sb.from("incomes")
+        .select("income_date,description,payer,amount,category,payment_method")
+        .eq("project_id", args.project_id).order("income_date", { ascending: false });
+      if (args.since) q = q.gte("income_date", args.since);
+      if (args.until) q = q.lte("income_date", args.until);
+      const { data } = await q.limit(clampLimit(args.limit, 100));
+      const rows = data ?? [];
+      const shartnoma = rows.filter(isContractIncome);
+      const kassa = rows.filter((r: any) => !isContractIncome(r));
+      const by: Record<string, number> = { Naqd: 0, Bank: 0 };
+      for (const r of kassa) {
+        const m = String(r.payment_method || "Naqd") === "Naqd" ? "Naqd" : "Bank";
+        by[m] += Number(r.amount || 0);
+      }
+      return {
+        kirim_total: sum(kassa, "amount"),
+        kirim_by_method: by,
+        shartnoma_kirim: sum(shartnoma, "amount"),
+        items: rows,
+      };
     }
     if (name === "get_work_progress") {
       let q = sb.from("work_progress")
@@ -155,11 +271,11 @@ async function runTool(name: string, args: any): Promise<any> {
         .eq("project_id", args.project_id).order("work_date", { ascending: false });
       if (args.since) q = q.gte("work_date", args.since);
       if (args.until) q = q.lte("work_date", args.until);
-      const { data } = await q.limit(args.limit ?? 50);
+      const { data } = await q.limit(clampLimit(args.limit, 50));
       return data;
     }
     if (name === "get_boq") {
-      let q = sb.from("boq_items").select("code,description,category,unit,qty,rate,planned_cost,actual_cost").eq("project_id", args.project_id).order("code");
+      let q = sb.from("boq_items").select("code,description,category,unit,qty,rate,planned_cost,actual_cost").eq("project_id", args.project_id).order("code").limit(1000);
       if (args.category) q = q.eq("category", args.category);
       const { data } = await q;
       return (data ?? []).map((r: any) => ({ ...r, pct: r.planned_cost > 0 ? Math.round((Number(r.actual_cost || 0) / Number(r.planned_cost)) * 1000) / 10 : 0 }));
@@ -172,7 +288,7 @@ async function runTool(name: string, args: any): Promise<any> {
     }
     if (name === "get_brigades") {
       const [b, wp, bp] = await Promise.all([
-        sb.from("brigades").select("id,name,leader,phone,member_count"),
+        sb.from("brigades").select("id,name,leader,phone,member_count").limit(500),
         sb.from("work_progress").select("brigade_id,total_value"),
         sb.from("brigade_payments").select("brigade_id,amount,kind"),
       ]);
@@ -185,15 +301,15 @@ async function runTool(name: string, args: any): Promise<any> {
     if (name === "get_brigade_detail") {
       const bid = args.brigade_id;
       const [b, m, p, w] = await Promise.all([
-        sb.from("brigades").select("*").eq("id", bid).maybeSingle(),
-        sb.from("brigade_members").select("*").eq("brigade_id", bid),
+        sb.from("brigades").select("id,name,leader,member_count").eq("id", bid).maybeSingle(),
+        sb.from("brigade_members").select("full_name,position").eq("brigade_id", bid).limit(100),
         sb.from("brigade_payments").select("payment_date,amount,kind,project_id,note").eq("brigade_id", bid).order("payment_date", { ascending: false }).limit(30),
         sb.from("work_progress").select("work_date,work_type,total_value,project_id").eq("brigade_id", bid).order("work_date", { ascending: false }).limit(30),
       ]);
       return { brigade: b.data, members: m.data, payments: p.data, work: w.data };
     }
     if (name === "get_employees") {
-      let q = sb.from("employees").select("id,full_name,position,phone,monthly_salary,active,firm_id").order("full_name");
+      let q = sb.from("employees").select("id,full_name,position,phone,monthly_salary,active,firm_id").order("full_name").limit(500);
       if (args.firm_id) q = q.eq("firm_id", args.firm_id);
       const { data } = await q;
       return data;
@@ -204,11 +320,11 @@ async function runTool(name: string, args: any): Promise<any> {
       if (args.project_id) q = q.eq("project_id", args.project_id);
       if (args.since) q = q.gte("payment_date", args.since);
       if (args.until) q = q.lte("payment_date", args.until);
-      const { data } = await q.limit(args.limit ?? 100);
+      const { data } = await q.limit(clampLimit(args.limit, 100));
       return data;
     }
     if (name === "get_suppliers") {
-      let q = sb.from("suppliers").select("id,name,contact,phone,inn,firm_id").order("name");
+      let q = sb.from("suppliers").select("id,name,contact,phone,inn,firm_id").order("name").limit(500);
       if (args.firm_id) q = q.eq("firm_id", args.firm_id);
       const { data } = await q;
       return data;
@@ -233,7 +349,7 @@ async function runTool(name: string, args: any): Promise<any> {
     }
     if (name === "get_recent_activity") {
       const pid = args.project_id;
-      const limit = args.limit ?? 10;
+      const limit = clampLimit(args.limit, 10);
       const [e, w, m, z, i] = await Promise.all([
         sb.from("expenses").select("expense_date,category,description,amount").eq("project_id", pid).order("created_at", { ascending: false }).limit(limit),
         sb.from("work_progress").select("work_date,work_type,total_value,brigade_name").eq("project_id", pid).order("created_at", { ascending: false }).limit(limit),
@@ -244,74 +360,120 @@ async function runTool(name: string, args: any): Promise<any> {
       return { expenses: e.data, work: w.data, receipts: m.data, zayavkalar: z.data, payments: i.data };
     }
     if (name === "global_finance") {
-      let projQ = sb.from("projects").select("id,firm_id,total_budget");
+      let projQ = sb.from("projects").select("id,firm_id,total_budget").limit(500);
       if (args.firm_id) projQ = projQ.eq("firm_id", args.firm_id);
       const { data: projs } = await projQ;
       const ids = (projs ?? []).map((p: any) => p.id);
-      if (ids.length === 0) return { projects: 0, budget: 0, payIn: 0, totalOut: 0, kassa: 0 };
-      const [exp, inc] = await Promise.all([
-        sb.from("expenses").select("amount,payment_method,project_id").in("project_id", ids),
-        sb.from("brigade_payments").select("amount,kind,source,project_id").in("project_id", ids),
+      if (ids.length === 0) return { projects: 0, budget: 0, kirim: 0, chiqim: 0, balans: 0 };
+      const [exp, inc, mat, work, pay] = await Promise.all([
+        allRows((a, b) => sb.from("expenses").select("amount,payment_method,category,source,project_id").in("project_id", ids).order("id").range(a, b)),
+        allRows((a, b) => sb.from("incomes").select("amount,payment_method,category,project_id").in("project_id", ids).order("id").range(a, b)),
+        allRows((a, b) => sb.from("material_receipts").select("total_price,qty,unit_price,project_id").in("project_id", ids).order("id").range(a, b)),
+        allRows((a, b) => sb.from("work_progress").select("total_value,qty_done,unit_price,project_id").in("project_id", ids).order("id").range(a, b)),
+        allRows((a, b) => sb.from("brigade_payments").select("amount,project_id").in("project_id", ids).order("id").range(a, b)),
       ]);
-      const incomes = (inc.data ?? []).filter((r: any) => (r.kind ?? "").toLowerCase() !== "avans");
-      const byMethod: Record<string, number> = { Naqd: 0, Bank: 0, Karta: 0, Boshqa: 0 };
-      for (const r of exp.data ?? []) { const m = String(r.payment_method || "Boshqa"); byMethod[m] = (byMethod[m] || 0) + Number(r.amount || 0); }
-      const inBy: Record<string, number> = {};
-      for (const r of incomes) { const k = String(r.source || r.kind || "Boshqa"); inBy[k] = (inBy[k] || 0) + Number(r.amount || 0); }
-      const payIn = sum(incomes, "amount");
-      const totalOut = sum(exp.data ?? [], "amount");
-      return {
-        projects: ids.length,
-        budget: sum(projs ?? [], "total_budget"),
-        payIn, in_by_source: inBy,
-        totalOut, out_by_method: byMethod,
-        kassa: payIn - totalOut,
-        net: payIn - totalOut,
-      };
+      const f = finance({ exp: exp.data, inc: inc.data, mat: mat.data, work: work.data, pay: pay.data });
+      return { projects: ids.length, budget: sum(projs ?? [], "total_budget"), ...f };
     }
-    return { error: `Noma'lum vosita: ${name}` };
+    return { error: "Noma'lum vosita" };
   } catch (e: any) {
-    return { error: e?.message ?? String(e) };
+    console.error("ai-agent tool error", name, e?.message ?? e);
+    return { error: "Ma'lumotni o'qib bo'lmadi" };
   }
 }
 
-const SYSTEM_PROMPT = `Sen "QurilishNazorat" qurilish boshqaruv tizimining bosh AI yordamchisisan — admin, loyiha menejeri (PM) va direktor (CEO) uchun ishlaysan. O'zbek tilida do'stona, aniq va professional javob ber. HAR QANDAY savolga javob ber: tizim ma'lumotlari, moliyaviy tahlil, taqqoslash, prognoz, salomlashish, umumiy maslahat, qurilish bo'yicha bilim.
+const SYSTEM_PROMPT = `Sen Innosite qurilish boshqaruv tizimining yordamchisisan. Faqat shu tizim ma'lumotlari haqida gaplashasan: loyihalar, smeta (BOQ), zayavka, xarajat, kirim, kassa, ombor, ishlar, brigadalar, xodimlar, yetkazib beruvchilar.
 
-TIZIM BO'LIMLARI VA VOSITALAR:
-• Loyihalar / firmalar — list_projects, list_firms, get_project
-• Moliya (byudjet, kirim, chiqim, kassa qoldig'i, sof natija) — get_summary, get_expenses, get_incomes, global_finance
-• Buyurtma (zayavka) reja va workflow — get_master_zayavka, get_zayavka_workflow
-• BOQ (smeta) va bajarilish % — get_boq
-• Variations (qo'shimcha ish) — get_variations
-• Ombor qabuli (nakladnoylar) — get_warehouse_receipts
-• Bajarilgan ishlar — get_work_progress
-• Brigadalar (balans, a'zolar, to'lovlar) — get_brigades, get_brigade_detail
-• Xodimlar va maoshlar — get_employees, get_employee_payments
-• Yetkazib beruvchilar va shartnomalar — get_suppliers, get_supplier_contracts
-• Master katalog — search_master
-• So'nggi aktivlik — get_recent_activity
+GAPIRISH USLUBI:
+• Oddiy, jonli o'zbek tilida — inson kabi. Rasmiy, kitobiy jumlalar yo'q.
+• Qisqa: 1-5 qator. Kerak bo'lsa 3-6 bullet. Ortiqcha kirish so'zi ("Albatta", "Ma'lumot bo'yicha", "Sizga yordam beraman") YOZMA — to'g'ridan-to'g'ri javob.
+• Har javobda faqat so'ralgan narsa bo'lsin. Taklif, savol, izoh qo'shma (foydalanuvchi o'zi so'ramasa).
+• Summalar: "12 500 000 so'm".
+• UUID/ID yozma — nom bilan ayt.
+
+HISOB MODELI (majburiy — shundan chetga chiqma):
+• Hamma pul harakati JURNALdan keladi. Jurnal — yagona baza.
+• CHIQIM = barcha xarajatlar. Kategoriyalari: Material, Ish, Xodimlar (oylik), Ustalar (brigada), Yordamchi/boshqa.
+• Material va Ish — bu "qabul qilindi" yoki "bajarildi" emas, bu PUL KETDI. Shunday ayt: "materiallarga 526 537 400 so'm ketgan", "ishlarga 195 520 000 so'm ketgan".
+• "to'g'ridan-to'g'ri xarajat" degan tushuncha YO'Q — xarajat bitta: chiqim. Uni bo'laklarga bo'lganda faqat yuqoridagi kategoriyalarni ishlat.
+• KIRIM = umumiy naqd + bank kirimi. Shartnoma kirimi alohida ko'rsatiladi.
+• BALANS = hozir naqd va bankda qancha pul borligi (sof pul oqimi = kirim − chiqim).
+• Xodimlar oylikda ishlaydi, ustalar hajm (abyom) bo'yicha — ularga shu kungacha berilgan pul chiqimda ko'rinadi.
+• Moliyaviy savolda get_summary (yoki global_finance) chaqir va o'sha qaytargan kirim / chiqim / chiqim_by_category / balans qiymatlaridan foydalan; o'zing qo'shib-ayirma.
 
 QOIDALAR:
-1. Loyihaga oid HAR QANDAY savolda kerakli vositalarni CHAQIR — taxmin qilma. Bir nechtasini parallel chaqirib natijalarni birlashtir.
-2. "Hozirgi/shu/joriy loyiha" → yetkazilgan project_id ni ishlat. Loyiha aytilmagan bo'lsa va savol loyihaga oidsa: avval list_projects bilan ro'yxatni ol, foydalanuvchi nomini matndan toping yoki aniq qaysi loyiha ekanini so'rang.
-3. Sana oraliqlari ("bu hafta", "bu oy", "yil boshidan", "kecha") — o'zing hisobla va since/until parametrlarda yubor.
-4. Summalar formatda: "12 500 000 so'm" (3 honali probel ajratuvchi).
-5. Ko'p qatorli ma'lumot uchun Markdown jadval ishlat. Jami va o'rtacha summalarni alohida ko'rsat.
-6. Tahlil/solishtirish so'ralganda: foiz, farq, tendensiya, anomaliya (juda katta xarajat, kechiktirilgan to'lov, byudjetdan oshgan BOQ) ni o'zing topib aytib ber.
-7. Topilmasa "topilmadi" deb ayt — soxta raqam yozma.
-8. Javob qisqa va aniq (3-8 qator). Foydalanuvchi "batafsil" desa kengaytir, jadval ber.
-9. Maxfiy ma'lumot (parol, token, RLS qoidalari, boshqa loyihalar haqida ruxsatsiz) so'ralsa rad et.
-10. Salom/umumiy savolda — vositalarni chaqirma, samimiy javob ber.
-11. Foydalanuvchi savolida bir nechta loyiha nomi yoki sana eslatilsa — har birini alohida tekshir.
-12. Qisqa xulosalar oxirida foydali keyingi qadam taklif qil (masalan: "Tasdiqlanmagan 5 ta zayavkani ko'rishni xohlaysizmi?").`;
+1. Har qanday raqamli savolda vositani CHAQIR, taxmin qilma. Bir nechtasini birga chaqirsa bo'ladi.
+2. "Bu loyiha" → berilgan project_id. Loyiha noaniq bo'lsa list_projects bilan tekshir, baribir noaniq bo'lsa bitta qisqa savol ber.
+3. Sana oraliqlarini o'zing hisobla (bu hafta, bu oy, kecha).
+4. Ma'lumot yo'q bo'lsa "ma'lumot yo'q" deb ayt — raqam o'ylab topma.
+5. Mavzudan tashqari savol (siyosat, ob-havo, umumiy suhbat, kod yozish) bo'lsa: "Men faqat Innosite ma'lumotlari bo'yicha yordam beraman" deb qisqa javob ber.
+6. Salomlashuvga bir qator bilan javob ber.
+7. Parol, token, kalit, ichki sozlamalar so'ralsa rad et.
+8. Vosita "ruxsat etilmagan" desa — foydalanuvchiga shu ma'lumotga ruxsati yo'qligini ayt.
+
+Vositalar: list_projects, list_firms, get_project, get_summary, get_master_zayavka, get_zayavka_workflow, get_boq, get_variations, get_warehouse_receipts, get_expenses, get_incomes, get_work_progress, get_brigades, get_brigade_detail, get_employees, get_employee_payments, get_suppliers, get_supplier_contracts, search_master, get_recent_activity, global_finance.`;
+
 
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  const cors = corsFor(req);
+  const jsonOk = (body: unknown) =>
+    new Response(JSON.stringify(body), { headers: { ...cors, "Content-Type": "application/json" } });
+  const jsonErr = (status: number, error: string) =>
+    new Response(JSON.stringify({ error }), { status, headers: { ...cors, "Content-Type": "application/json" } });
+
+  if (req.method === "OPTIONS") return new Response(null, { headers: cors });
   try {
-    const { messages, project_id, firm_id, client } = await req.json();
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return new Response(JSON.stringify({ error: "Xabar bo'sh" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (req.method !== "POST") return jsonErr(405, "Method not allowed");
+    // 1) Autentifikatsiya: foydalanuvchi JWT yoki ichki server kaliti (faqat aniq tenglik).
+    const authHeader = req.headers.get("authorization") ?? "";
+    if (!authHeader.toLowerCase().startsWith("bearer ")) return jsonErr(401, "Unauthorized");
+    const jwt = authHeader.slice(7).trim();
+    const isInternal = safeEq(jwt, SUPABASE_SERVICE_ROLE_KEY) || await isServiceRoleJwt(jwt);
+    let sb: any = admin;
+    let allowedProjects: string[] | null = null;
+    let isProjectScoped = false;
+    let uid: string;
+    const raw = await req.text();
+    if (raw.length > 100_000) return jsonErr(413, "So'rov juda katta");
+    let body: any;
+    try { body = JSON.parse(raw); } catch { return jsonErr(400, "Noto'g'ri so'rov"); }
+    if (isInternal) {
+      // Ichki chaqiruv ham kim nomidan ekanini aytishi shart — o'sha foydalanuvchi rollari qo'llanadi.
+      const tgId = Number(body?.telegram_user_id);
+      if (!Number.isSafeInteger(tgId) || tgId <= 0) return jsonErr(403, "Forbidden");
+      const { data: prof } = await admin.from("profiles").select("id,is_active").eq("telegram_user_id", tgId).maybeSingle();
+      if (!prof || prof.is_active === false) return jsonErr(403, "Forbidden");
+      uid = String(prof.id);
+    } else {
+      const { data: userData, error: userErr } = await admin.auth.getUser(jwt);
+      if (userErr || !userData?.user) return jsonErr(401, "Unauthorized");
+      uid = userData.user.id;
+      // Ma'lumot foydalanuvchi JWT si bilan o'qiladi — RLS chetlab o'tilmaydi.
+      sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false },
+        global: { headers: { Authorization: `Bearer ${jwt}` } },
+      });
     }
+    // Avtorizatsiya: real app_role modeli — ikkala yo'lda bir xil.
+    const { data: roleRows } = await admin.from("user_roles").select("role").eq("user_id", uid);
+    const roles = (roleRows ?? []).map((r: any) => String(r.role));
+    const orgWide = roles.some((r) => ORG_WIDE_ROLES.includes(r));
+    const projectScoped = !orgWide && roles.some((r) => PROJECT_ROLES.includes(r));
+    if (!orgWide && !projectScoped) return jsonErr(403, "Forbidden");
+    isProjectScoped = projectScoped;
+    if (projectScoped) {
+      const { data: pa } = await admin.from("user_project_access").select("project_id").eq("user_id", uid);
+      allowedProjects = (pa ?? []).map((r: any) => String(r.project_id));
+    }
+
+    const { project_id, firm_id, client } = body ?? {};
+    let messages = body?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return jsonErr(400, "Xabar bo'sh");
+    if (project_id != null && !UUID_RE.test(String(project_id))) return jsonErr(400, "project_id noto'g'ri");
+    if (firm_id != null && !UUID_RE.test(String(firm_id))) return jsonErr(400, "firm_id noto'g'ri");
+    if (allowedProjects && project_id && !allowedProjects.includes(project_id)) return jsonErr(403, "Forbidden");
+    messages = messages.slice(-30).map((m: any) => ({ role: m?.role, content: String(m?.content ?? "").slice(0, 4000) }));
+
     const sysParts = [SYSTEM_PROMPT];
     const today = new Date().toISOString().slice(0, 10);
     sysParts.push(`Bugungi sana: ${today}.`);
@@ -332,98 +494,77 @@ QAT'IY QOIDALAR:
       );
     } else if (client === "mobile") {
       sysParts.push(
-`MOBIL REJIM: Foydalanuvchi telefondan yozyapti. Markdown JADVAL (| ... |) ISHLATMA — kichik ekranda chiqib ketadi.
-O'rniga har bir yozuvni alohida blok qilib ber:
-
-**Nomi**
-• Maydon: qiymat
-• Maydon: qiymat
-
-Bloklar orasida bo'sh qator qoldir. Summalarni **bold** qil. Javob qisqa va vertikal o'qishga qulay bo'lsin.`
+`MOBIL REJIM: Telefon ekrani. Jadval (| ... |) ishlatma. Har yozuvni qisqa qator qilib ber, summani **bold** qil. Jami 1-6 qator.`
       );
     } else if (client === "web") {
       sysParts.push(
-`WEB REJIM: Foydalanuvchi katta ekranda ko'radi. Javobni chiroyli va o'qishga oson tuz:
-
-• Bo'limlar uchun "## Sarlavha" (h2) yoki "### Kichik sarlavha" (h3) ishlat — bittadan ortiq bo'lim bo'lsa.
-• Asosiy ko'rsatkichlarni (byudjet, kassa, qoldiq, bajarilish %) qisqa bullet ro'yxat bilan ber:
-  - **Byudjet:** 11 000 000 000 so'm
-  - **Bajarilish:** 42 %
-  - **Kassa qoldig'i:** 250 000 so'm
-• 3+ qator bir xil turdagi ma'lumot bo'lsa — Markdown jadval (| Ustun | ... |) ishlat, sarlavha qatori va kerak bo'lsa "**Jami**" qatori bilan.
-• Bo'limlar orasida bo'sh qator qoldir. Har abzats 1-3 qator bo'lsin.
-• Muhim ogohlantirish: "> ⚠️ ..." blockquote bilan ajrat. Yaxshi yangilik: "> ✅ ...".
-• Oxirida qisqa **Keyingi qadam:** taklif bilan tugat (1 qator).
-• Xom ID/UUID yozma — foydalanuvchi tushunadigan nomda ko'rsat.`
+`WEB REJIM: Qisqa bullet ro'yxat bilan ber. 3+ bir xil qator bo'lsagina Markdown jadval ishlat. Sarlavha, uzun kirish yoki yakuniy taklif yozma.`
       );
     }
 
     const systemPrompt = sysParts.join("\n\n");
+    // Modelga faqat kerakli tool ta'riflari: core + savol mavzusidagi specialist/rare.
+    const toolNames = new Set(selectToolNames({ text: recentUserText(messages), projectScoped: isProjectScoped }));
+    const turnTools = tools.filter((t) => toolNames.has(t.function.name));
 
-    // OpenAI-style tools → Anthropic format
-    const anthropicTools = tools.map((t: any) => ({
-      name: t.function.name,
-      description: t.function.description,
-      input_schema: t.function.parameters,
-    }));
+    // Lovable AI Gateway (OpenAI-uslub tool calling)
+    type CMsg = { role: string; content: any; tool_calls?: any[]; tool_call_id?: string };
+    const convo: CMsg[] = [
+      { role: "system", content: systemPrompt },
+      ...messages.map((m: any) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: typeof m.content === "string" ? m.content : String(m.content ?? ""),
+      })),
+    ];
 
-    // OpenAI-style messages → Anthropic format (skip system; convert tool role)
-    type AMsg = { role: "user" | "assistant"; content: any };
-    const convo: AMsg[] = messages.map((m: any) => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: typeof m.content === "string" ? m.content : String(m.content ?? ""),
-    }));
-
-    for (let turn = 0; turn < 14; turn++) {
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
+    for (let turn = 0; turn < 6; turn++) {
+      const r = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
         method: "POST",
         headers: {
-          "x-api-key": ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: ANTHROPIC_MODEL,
-          max_tokens: 4096,
-          system: systemPrompt,
+          model: AI_MODEL,
           messages: convo,
-          tools: anthropicTools,
+          tools: turnTools,
+          tool_choice: "auto",
+          // Gemini 3.7 Flash: fikrlashni o'chiramiz — tez va aniq javob.
+          reasoning: { thinking: "none" },
+          max_tokens: 700,
         }),
       });
-      if (r.status === 429) return new Response(JSON.stringify({ error: "AI limit oshib ketdi, biroz kuting.", reply: "⚠️ AI so'rov limiti vaqtincha oshib ketdi. Bir oz kutib qaytadan urinib ko'ring." }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      if (r.status === 401 || r.status === 403) return new Response(JSON.stringify({ error: "Anthropic kaliti noto'g'ri.", reply: "⚠️ Anthropic API kaliti noto'g'ri yoki muddati o'tgan. Lovable secrets'da ANTHROPIC_API_KEY ni yangilang." }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      if (r.status === 402 || r.status === 529) return new Response(JSON.stringify({ error: "Anthropic krediti tugadi.", reply: "⚠️ Anthropic balansi tugadi yoki overload. console.anthropic.com'da balansni tekshiring." }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      if (r.status === 429) return jsonOk({ reply: "⚠️ AI band. Bir oz kutib qayta so'rang." });
+      if (r.status === 402) return jsonOk({ reply: "⚠️ AI krediti tugagan. Lovable workspace'da kredit to'ldiring." });
+      if (r.status === 401 || r.status === 403) return jsonOk({ reply: "⚠️ AI xizmati hozir ishlamayapti." });
       if (!r.ok) {
         const t = await r.text();
-        console.error("Anthropic error", r.status, t);
-        return new Response(JSON.stringify({ error: `AI xato: ${r.status}`, reply: `⚠️ AI xatosi: ${r.status}. ${t.slice(0, 200)}` }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        console.error("AI gateway error", r.status, t.slice(0, 500));
+        return jsonOk({ reply: `⚠️ AI vaqtincha ishlamayapti (${r.status}). Keyinroq urinib ko'ring.` });
       }
       const j = await r.json();
-      const contentBlocks: any[] = j?.content ?? [];
-      if (!contentBlocks.length) return new Response(JSON.stringify({ error: "AI bo'sh javob", reply: "🤔 AI bo'sh javob qaytardi." }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const m = j?.choices?.[0]?.message;
+      if (!m) return jsonOk({ reply: "🤔 AI bo'sh javob qaytardi." });
+      const calls: any[] = (m.tool_calls ?? []).slice(0, MAX_TOOL_CALLS_PER_TURN);
+      convo.push({ role: "assistant", content: m.content ?? "", tool_calls: calls.length ? calls : undefined });
 
-      // Push assistant turn as-is (content blocks)
-      convo.push({ role: "assistant", content: contentBlocks });
-
-      const toolUses = contentBlocks.filter((b) => b.type === "tool_use");
-      if (!toolUses.length) {
-        const reply = contentBlocks
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join("\n")
-          .trim() || "🤔 Javob bo'sh chiqdi. Savolni boshqacha shaklda yozib ko'ring.";
-        return new Response(JSON.stringify({ reply }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      if (!calls.length) {
+        const reply = String(m.content ?? "").trim() || "🤔 Javob bo'sh chiqdi. Savolni boshqacha yozing.";
+        return jsonOk({ reply });
       }
 
-      const toolResults = await Promise.all(toolUses.map(async (tu: any) => {
-        const result = await runTool(tu.name, tu.input ?? {});
-        return { type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(result).slice(0, 14000) };
+      const results = await Promise.all(calls.map(async (c: any) => {
+        let args: any = {};
+        try { args = JSON.parse(String(c.function?.arguments ?? "{}").slice(0, 4000)); } catch { /* noop */ }
+        const result = await runTool(String(c.function?.name ?? ""), args, { sb, allowedProjects });
+        return { role: "tool", tool_call_id: c.id, content: JSON.stringify(result).slice(0, 14000) } as CMsg;
       }));
-      convo.push({ role: "user", content: toolResults });
+      convo.push(...results);
     }
-    return new Response(JSON.stringify({ reply: "Iltimos savolni aniqroq yozing." }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    return jsonOk({ reply: "Savolni biroz aniqroq yozing." });
+
   } catch (e: any) {
-    console.error("ai-agent error", e);
-    return new Response(JSON.stringify({ error: e?.message ?? "Server xato" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    console.error("ai-agent error", e?.message ?? e);
+    return jsonErr(500, "Server xatosi");
   }
 });

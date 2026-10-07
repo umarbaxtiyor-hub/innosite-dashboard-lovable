@@ -326,7 +326,7 @@ function MiniApp() {
               <input placeholder="Tavsif (masalan: Yo'l puli)" value={r.name} onChange={(e) => updateRow(i, { name: e.target.value })} style={inp} />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 <select value={r.category} onChange={(e) => updateRow(i, { category: e.target.value })} style={inp}>
-                  {["Bozorlik", "Transport", "Yordamchi", "Xodimlar", "Boshqa"].map((c) => (
+                  {["Qurilish materiali", "Oziq-ovqat", "Benzin", "Salyarka", "Texnika", "Ofis/Lager", "Oylik", "Avans", "Boshqa"].map((c) => (
                     <option key={c} value={c}>{c}</option>
                   ))}
 

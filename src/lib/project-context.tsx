@@ -16,6 +16,24 @@ type Ctx = {
 const ProjectContext = createContext<Ctx | null>(null);
 const STORAGE_KEY = "active_project_id";
 
+// Oxirgi uchtalik tartibi: Admin → BESS PV → Vodakanal. Qolganlari alifbo bo'yicha oldinda.
+const TAIL_ORDER = ["admin", "bess", "vodakanal"];
+function tailRank(name: string) {
+  const n = name.toLowerCase();
+  const i = TAIL_ORDER.findIndex((t) => n.includes(t));
+  return i === -1 ? -1 : i;
+}
+export function sortProjects<T extends { name: string }>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => {
+    const ra = tailRank(a.name);
+    const rb = tailRank(b.name);
+    if (ra === -1 && rb === -1) return a.name.localeCompare(b.name);
+    if (ra === -1) return -1;
+    if (rb === -1) return 1;
+    return ra - rb;
+  });
+}
+
 export function ActiveProjectProvider({ children }: { children: ReactNode }) {
   const [activeProjectId, setActive] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -33,8 +51,10 @@ export function ActiveProjectProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT") return;
       window.setTimeout(() => {
-        setUserId(session?.user?.id ?? null);
+        const nextUserId = session?.user?.id ?? null;
+        setUserId((current) => (current === nextUserId ? current : nextUserId));
         if (event === "SIGNED_OUT") {
           setActive(null);
           if (typeof window !== "undefined") sessionStorage.removeItem(STORAGE_KEY);
@@ -49,7 +69,11 @@ export function ActiveProjectProvider({ children }: { children: ReactNode }) {
 
   const { data: projects = [], isLoading } = useQuery({
     queryKey: ["projects-list-scoped", userId, hydrated],
-    staleTime: 2 * 60_000,
+    staleTime: Infinity,
+    gcTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     enabled: hydrated,
     queryFn: async () => {
       const uid = userId;
@@ -66,7 +90,7 @@ export function ActiveProjectProvider({ children }: { children: ReactNode }) {
         .select("id,name,code,firm_id")
         .order("name");
       if (error) throw error;
-      const all = (data ?? []) as Array<Project & { firm_id: string | null }>;
+      const all = sortProjects((data ?? []) as Array<Project & { firm_id: string | null }>);
 
       // Admin/CEO/Direktor/Finans — hammasi
       if (!uid) return [];

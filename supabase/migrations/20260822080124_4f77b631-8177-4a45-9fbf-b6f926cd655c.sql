@@ -1,0 +1,2 @@
+REVOKE EXECUTE ON FUNCTION public.recompute_zayavka_progress(uuid) FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.log_trigger_error(text, text, uuid, text, text, text) FROM anon, authenticated;

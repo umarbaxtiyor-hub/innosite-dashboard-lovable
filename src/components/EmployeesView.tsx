@@ -45,22 +45,53 @@ function avatarTint(name: string) {
   return AVATAR_TINTS[h % AVATAR_TINTS.length];
 }
 
+const isSalaryCat = (c: string) => {
+  const s = (c || "").toLowerCase();
+  return s.includes("oylik") || s.includes("ish haqi") || s.includes("avans") || s.includes("maosh") || s.includes("usta haqi");
+};
+
 export function EmployeesView() {
   const { activeProjectId } = useActiveProject();
   const [emps, setEmps] = useState<Employee[]>([]);
   const [pays, setPays] = useState<Pay[]>([]);
+  const [umumiy, setUmumiy] = useState<number>(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [q, setQ] = useState("");
 
+  async function fetchAll<T>(build: (from: number, to: number) => any, pageSize = 1000): Promise<T[]> {
+    const out: T[] = []; let from = 0;
+    while (true) {
+      const to = from + pageSize - 1;
+      const { data, error } = await build(from, to);
+      if (error) break;
+      const rows = (data ?? []) as T[];
+      out.push(...rows);
+      if (rows.length < pageSize) break;
+      from += pageSize;
+    }
+    return out;
+  }
+
   async function load() {
-    const [e, p] = await Promise.all([
+    const [e, p, exRows, bpRows] = await Promise.all([
       supabase.from("employees").select("*").eq("active", true).order("full_name"),
       supabase.from("employee_payments").select("id,employee_id,kind,amount,payment_date,note"),
+      fetchAll<any>((from, to) => {
+        const q = supabase.from("expenses").select("amount,category,project_id").range(from, to);
+        return activeProjectId ? q.eq("project_id", activeProjectId) : q;
+      }),
+      fetchAll<any>((from, to) => {
+        const q = supabase.from("brigade_payments").select("amount,project_id").range(from, to);
+        return activeProjectId ? q.eq("project_id", activeProjectId) : q;
+      }),
     ]);
     setEmps((e.data ?? []) as Employee[]);
     setPays((p.data ?? []) as Pay[]);
+    const salarySum = exRows.reduce((s: number, r: any) => s + (isSalaryCat(String(r.category)) ? Number(r.amount) || 0 : 0), 0);
+    const brigSum = bpRows.reduce((s: number, r: any) => s + (Number(r.amount) || 0), 0);
+    setUmumiy(salarySum + brigSum);
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [activeProjectId]);
 
   const rows = useMemo(() => emps.map((emp) => {
     const paid = pays.filter((x) => x.employee_id === emp.id).reduce((s, x) => s + Number(x.amount || 0), 0);
@@ -119,10 +150,27 @@ export function EmployeesView() {
         <PickEmployeePaymentDialog employees={rows} projectId={activeProjectId} onAdded={load} />
       </div>
 
+      {/* Umumiy — jami xodimlar xarajati (kelajakda alohida xodimlar qo'shiladi) */}
+      <div className="rounded-2xl border bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-500/10 dark:to-teal-500/10 border-emerald-200/60 dark:border-emerald-500/20 p-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 text-lg font-bold">
+            U
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-[15px] font-semibold">Umumiy</div>
+            <div className="text-xs text-muted-foreground">Jami xodimlar xarajati</div>
+          </div>
+          <div className="shrink-0 text-right">
+            <div className="text-[10px] uppercase text-muted-foreground">Summa</div>
+            <div className="text-base font-extrabold tabular-nums text-emerald-700 dark:text-emerald-400">{fmtUZSc(umumiy)}</div>
+          </div>
+        </div>
+      </div>
+
       {/* Xodimlar ro'yxati */}
       <div className="rounded-2xl border bg-card overflow-hidden">
         {filtered.length === 0 ? (
-          <div className="px-4 py-10 text-center text-sm text-muted-foreground">Xodim topilmadi</div>
+          <div className="px-4 py-10 text-center text-sm text-muted-foreground">Xodim qo'shilmagan. Yangi xodim qo'shish uchun yuqoridagi tugmani bosing.</div>
         ) : (
           <ul className="divide-y">
             {filtered.map((r) => (

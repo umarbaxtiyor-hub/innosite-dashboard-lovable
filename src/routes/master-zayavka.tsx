@@ -8,6 +8,7 @@ import { SummaryCard } from "@/components/zayavka/SummaryCard";
 import { DonutCard } from "@/components/zayavka/DonutCard";
 import { ExcelUploadCard } from "@/components/zayavka/ExcelUploadCard";
 import { ItemsTable } from "@/components/zayavka/ItemsTable";
+import { OperatsionCategories } from "@/components/zayavka/OperatsionCategories";
 
 import { AddItemDialog } from "@/components/zayavka/AddItemDialog";
 import { Button } from "@/components/ui/button";
@@ -15,12 +16,13 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { toast } from "sonner";
 import { useCurrentRoles } from "@/hooks/use-current-roles";
 import type { Kind, Z } from "@/components/zayavka/types";
+import { isMaterialMirrorExpense } from "@/lib/boq-category-map";
 
 
 export const Route = createFileRoute("/master-zayavka")({
-  validateSearch: (search: Record<string, unknown>): { tab?: "material" | "work" | "variations" } => {
+  validateSearch: (search: Record<string, unknown>): { tab?: "material" | "work" | "variations" | "ustalar" } => {
     const t = search.tab;
-    return { tab: t === "work" || t === "variations" || t === "material" ? t : undefined };
+    return { tab: t === "work" || t === "variations" || t === "material" || t === "ustalar" ? t : undefined };
   },
   head: () => ({
     meta: [
@@ -40,10 +42,43 @@ function ZayavkaPage() {
   const showAmount = hasAny(["admin", "finans", "ceo"]);
   const search = Route.useSearch();
   const [items, setItems] = useState<Z[]>([]);
-  const [tab, setTab] = useState<"material" | "work" | "variations">(search.tab ?? "material");
+  const [tab, setTab] = useState<"material" | "work" | "variations">(search.tab === "ustalar" ? "work" : (search.tab ?? "material"));
   const [usage, setUsage] = useState<{ material: number; work: number; equipment: number }>({ material: 0, work: 0, equipment: 0 });
+  const [opsLimit, setOpsLimit] = useState(0);
+  const [opsUsed, setOpsUsed] = useState(0);
+
+  useEffect(() => {
+    if (!activeProjectId) { setOpsLimit(0); setOpsUsed(0); return; }
+    (async () => {
+      const [lim, exp, mat, pay] = await Promise.all([
+        supabase.from("project_zayavka").select("unit_price,total").eq("project_id", activeProjectId).eq("kind", "equipment").is("parent_id", null).limit(1).maybeSingle(),
+        supabase.from("expenses").select("amount,kind,source").eq("project_id", activeProjectId),
+        supabase.from("material_receipts").select("qty,unit_price,total_price").eq("project_id", activeProjectId),
+        supabase.from("brigade_payments").select("amount").eq("project_id", activeProjectId),
+      ]);
+      setOpsLimit(Number((lim.data as any)?.unit_price ?? (lim.data as any)?.total ?? 0));
+
+      // Pul nazorati: Material + Ishlar + Operatsion = jami chiqim
+      const exps = (exp.data ?? []).filter((r: any) => !isMaterialMirrorExpense(r));
+      const expSum = exps.reduce((s: number, r: any) => s + Number(r.amount || 0), 0);
+      const matSum = (mat.data ?? []).reduce(
+        (s: number, r: any) => s + (Number(r.total_price) || Number(r.qty) * Number(r.unit_price) || 0),
+        0,
+      );
+      const paySum = (pay.data ?? []).reduce((s: number, r: any) => s + Number(r.amount || 0), 0);
+      const byKind = (ks: string[]) =>
+        exps.filter((r: any) => ks.includes(String(r.kind ?? ""))).reduce((s: number, r: any) => s + Number(r.amount || 0), 0);
+      const total = matSum + expSum + paySum;
+      const usedMat = matSum + byKind(["boq_material"]);
+      const usedWork = paySum + byKind(["boq_work", "ustalar"]);
+      setUsage({ material: usedMat, work: usedWork, equipment: 0 });
+      setOpsUsed(total - usedMat - usedWork);
+    })();
+  }, [activeProjectId]);
+
+
   
-  useEffect(() => { if (search.tab) setTab(search.tab); }, [search.tab]);
+  useEffect(() => { if (search.tab) setTab(search.tab === "ustalar" ? "work" : search.tab); }, [search.tab]);
   // Sub-zayavkalardan hisoblanadi (parent_id orqali)
   const [reqByZ, setReqByZ] = useState<Record<string, number>>({});
   const [recvByZ, setRecvByZ] = useState<Record<string, number>>({});
@@ -107,62 +142,43 @@ function ZayavkaPage() {
       }
       if (masterId) addFact(masterId, q, v);
     });
-    setFactByZ(fact);
-
-    // Per-card usage: fact qiymatlarni master qatorlarga to'plab, off_plan / kind bo'yicha taqsimlaymiz.
-    let usageMat = 0, usageWork = 0, usageExtras = 0;
-    masters.forEach((m) => {
-      const v = fact[m.id]?.value ?? 0;
-      if (v <= 0) return;
-      if (m.off_plan) usageExtras += v;
-      else if (m.kind === "material") usageMat += v;
-      else if (m.kind === "work") usageWork += v;
+    // Kunlik hisobot (Daily Report) satrlari — asosan 'ustalar' turi uchun hajm + hisob
+    const { data: daily } = await supabase
+      .from("daily_report_lines")
+      .select("qty_done,zayavka_id")
+      .in("zayavka_id", Object.keys(zayavkaToMaster));
+    (daily ?? []).forEach((r: any) => {
+      const q = Number(r.qty_done || 0);
+      if (q <= 0) return;
+      const masterId = r.zayavka_id ? (zayavkaToMaster[r.zayavka_id] ?? null) : null;
+      if (!masterId) return;
+      const m = masters.find((x) => x.id === masterId);
+      if (!m) return;
+      const v = q * Number(m.unit_price || 0);
+      addFact(masterId, q, v);
     });
-    setUsage({ material: usageMat, work: usageWork, equipment: usageExtras });
+    setFactByZ(fact);
+    // Per-card usage endi alohida hisoblanadi (usage effect) — pul nazorati mantiqiga mos.
+    // Bu yerda fact bo'yicha progress ko'rsatkichlari uchun faqat fact qoladi.
   }
+
   useEffect(() => { loadItems(); }, [activeProjectId]);
 
-  // Realtime: yangilanishlarni avtomatik tortib olish
-  useEffect(() => {
-    if (!activeProjectId) return;
-    const ch = supabase
-      .channel(`mz-${activeProjectId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "project_zayavka", filter: `project_id=eq.${activeProjectId}` }, () => loadItems())
-      .on("postgres_changes", { event: "*", schema: "public", table: "material_receipts", filter: `project_id=eq.${activeProjectId}` }, () => loadItems())
-      .on("postgres_changes", { event: "*", schema: "public", table: "work_progress", filter: `project_id=eq.${activeProjectId}` }, () => loadItems())
-      .subscribe();
-    return () => { supabase.removeChannel(ch); };
-  }, [activeProjectId]);
-
-  // Bot orqali kelgan o'zgarishlarni ushlash uchun: sahifa fokuslanganda yoki
-  // tab ko'rinarli bo'lganda qayta yuklash (realtime event tushib qolgan bo'lsa ham)
-  useEffect(() => {
-    if (!activeProjectId) return;
-    const onFocus = () => loadItems();
-    const onVisible = () => { if (document.visibilityState === "visible") loadItems(); };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisible);
-    const iv = window.setInterval(() => {
-      if (document.visibilityState === "visible") loadItems();
-    }, 20000);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.clearInterval(iv);
-    };
-  }, [activeProjectId]);
+  // Avtomatik refresh yo'q: smeta faqat sahifa ochilganda yoki pull-to-refresh orqali yangilanadi.
 
 
 
   const filtered = useMemo(() => {
     if (tab === "variations") return items.filter((i) => i.off_plan === true);
+    if (tab === "work") return items.filter((i) => (i.kind === "work" || i.kind === "ustalar") && !i.off_plan);
     return items.filter((i) => i.kind === (tab as Kind) && !i.off_plan);
   }, [items, tab]);
   const totals = useMemo(() => {
-    const sum = (k: Kind) => items.filter((i) => i.kind === k && !i.off_plan)
+    const sum = (...ks: Kind[]) => items.filter((i) => ks.includes(i.kind) && !i.off_plan)
       .reduce((s, i) => s + Number(i.total || 0), 0);
-    return { material: sum("material"), work: sum("work"), equipment: sum("equipment") };
+    return { material: sum("material"), work: sum("work", "ustalar"), equipment: sum("equipment") };
   }, [items]);
+
   
   
 
@@ -225,18 +241,15 @@ function ZayavkaPage() {
         <>
           <div className="rounded-2xl border-2 border-[var(--card-frame)] bg-card p-2 sm:p-3 space-y-2">
             {(() => {
-              const extrasSum = items
-                .filter((i) => i.off_plan === true)
-                .reduce((s, i) => s + (Number(i.total) || Number(i.qty) * Number(i.unit_price) || 0), 0);
-              const grandLimit = totals.material + totals.work + extrasSum;
-              const grandUsed = usage.material + usage.work + usage.equipment;
+              const grandLimit = totals.material + totals.work + opsLimit;
+              const grandUsed = usage.material + usage.work + opsUsed;
               return (
                 <>
                   <SummaryCard label="Umumiy limit" value={grandLimit} used={grandUsed} frame="navy" highlight flat showAmount={showAmount} />
                   <div className="grid grid-cols-3 gap-2 sm:gap-3">
                     <DonutCard label="Materiallar" value={totals.material} used={usage.material} active={tab === "material"} onClick={() => setTab("material")} frame="navy" showAmount={showAmount} />
                     <DonutCard label="Ish turlari" value={totals.work} used={usage.work} active={tab === "work"} onClick={() => setTab("work")} frame="orange" showAmount={showAmount} />
-                    <DonutCard label="Yordamchi" value={extrasSum} used={usage.equipment} active={tab === "variations"} onClick={() => setTab("variations")} frame="green" showAmount={showAmount} />
+                    <DonutCard label="Operatsion" value={opsLimit} used={opsUsed} active={tab === "variations"} onClick={() => setTab("variations")} frame="green" showAmount={showAmount} />
                   </div>
                 </>
               );
@@ -251,7 +264,7 @@ function ZayavkaPage() {
               <ItemsTable rows={filtered} reqByZ={reqByZ} recvByZ={recvByZ} factByZ={factByZ} onChanged={loadItems} title="Ish turlari — asosiy ulush" canEdit={canEdit} showAmount={showAmount} />
             )}
             {tab === "variations" && (
-              <ItemsTable rows={filtered} reqByZ={reqByZ} recvByZ={recvByZ} factByZ={factByZ} onChanged={loadItems} title="Yordamchi — rejadan tashqari" canEdit={canEdit} showAmount={showAmount} />
+              <OperatsionCategories projectId={activeProjectId} limit={opsLimit} showAmount={showAmount} />
             )}
           </div>
         </>

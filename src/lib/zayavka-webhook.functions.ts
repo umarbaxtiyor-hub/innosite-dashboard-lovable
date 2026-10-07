@@ -1,10 +1,20 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+
+async function assertHasAnyRole(userId: string, roles: string[]) {
+  const { data } = await supabaseAdmin
+    .from("user_roles").select("role").eq("user_id", userId);
+  const have = (data ?? []).map((r: any) => String(r.role));
+  if (!roles.some((r) => have.includes(r))) throw new Error("Forbidden");
+}
 
 export const sendZayavkaToMake = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ zayavka_id: z.string().uuid() }).parse)
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    await assertHasAnyRole(context.userId, ["admin", "ceo", "direktor", "finans", "pm", "taminotchi"]);
     const url = process.env.MAKE_ZAYAVKA_WEBHOOK_URL;
     if (!url) throw new Error("MAKE_ZAYAVKA_WEBHOOK_URL not configured");
 
@@ -50,8 +60,10 @@ export const sendZayavkaToMake = createServerFn({ method: "POST" })
 // Submit bo'lgan zayavka uchun barcha adminlarga Telegram orqali xabar
 // + Approve/Reject inline tugmalari yuboradi.
 export const notifyAdminsZayavkaSubmitted = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ zayavka_id: z.string().uuid() }).parse)
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    await assertHasAnyRole(context.userId, ["admin", "ceo", "direktor", "finans", "pm", "taminotchi", "omborchi"]);
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) return { ok: false, sent: 0, reason: "no_token" };
 
@@ -124,12 +136,14 @@ const STAGE_MSG: Record<string, { title: string; emoji: string }> = {
 };
 
 export const notifyRoleZayavkaStage = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     zayavka_id: z.string().uuid(),
     role: z.string(),
     extra_note: z.string().optional(),
   }).parse)
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    await assertHasAnyRole(context.userId, ["admin", "ceo", "direktor", "finans", "pm", "taminotchi", "omborchi", "buxgalter"]);
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) return { ok: false, sent: 0, reason: "no_token" };
 

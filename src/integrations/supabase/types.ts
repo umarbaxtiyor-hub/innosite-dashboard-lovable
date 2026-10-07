@@ -14,6 +14,65 @@ export type Database = {
   }
   public: {
     Tables: {
+      ai_insights: {
+        Row: {
+          created_at: string
+          evidence: Json
+          fingerprint: string
+          id: string
+          last_seen_at: string
+          metric: string | null
+          notified_at: string | null
+          project_id: string | null
+          recommended_action: string | null
+          rule_key: string
+          severity: string
+          source: string
+          status: string
+          title: string
+        }
+        Insert: {
+          created_at?: string
+          evidence?: Json
+          fingerprint: string
+          id?: string
+          last_seen_at?: string
+          metric?: string | null
+          notified_at?: string | null
+          project_id?: string | null
+          recommended_action?: string | null
+          rule_key: string
+          severity: string
+          source?: string
+          status?: string
+          title: string
+        }
+        Update: {
+          created_at?: string
+          evidence?: Json
+          fingerprint?: string
+          id?: string
+          last_seen_at?: string
+          metric?: string | null
+          notified_at?: string | null
+          project_id?: string | null
+          recommended_action?: string | null
+          rule_key?: string
+          severity?: string
+          source?: string
+          status?: string
+          title?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ai_insights_project_id_fkey"
+            columns: ["project_id"]
+            isOneToOne: false
+            referencedRelation: "projects"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       app_settings: {
         Row: {
           key: string
@@ -161,6 +220,51 @@ export type Database = {
         }
         Relationships: []
       }
+      bot_sheet_outbox: {
+        Row: {
+          attempts: number
+          created_at: string
+          dedup_key: string
+          error: string | null
+          id: string
+          kind: string
+          rows: Json
+          spreadsheet_id: string
+          status: string
+          tab: string
+          width: number
+          written_at: string | null
+        }
+        Insert: {
+          attempts?: number
+          created_at?: string
+          dedup_key: string
+          error?: string | null
+          id: string
+          kind: string
+          rows: Json
+          spreadsheet_id: string
+          status?: string
+          tab: string
+          width: number
+          written_at?: string | null
+        }
+        Update: {
+          attempts?: number
+          created_at?: string
+          dedup_key?: string
+          error?: string | null
+          id?: string
+          kind?: string
+          rows?: Json
+          spreadsheet_id?: string
+          status?: string
+          tab?: string
+          width?: number
+          written_at?: string | null
+        }
+        Relationships: []
+      }
       brigade_members: {
         Row: {
           brigade_id: string
@@ -221,6 +325,7 @@ export type Database = {
           project_id: string
           source: string | null
           source_note: string | null
+          submission_row_id: string | null
           telegram_user_id: number | null
         }
         Insert: {
@@ -237,6 +342,7 @@ export type Database = {
           project_id: string
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
         }
         Update: {
@@ -253,6 +359,7 @@ export type Database = {
           project_id?: string
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
         }
         Relationships: [
@@ -309,6 +416,150 @@ export type Database = {
             columns: ["firm_id"]
             isOneToOne: false
             referencedRelation: "firms"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      daily_report_lines: {
+        Row: {
+          activity_name: string | null
+          boq_item_id: string | null
+          brigade_id: string | null
+          brigade_name: string | null
+          created_at: string
+          equipment_hours: number | null
+          equipment_name: string | null
+          id: string
+          note: string | null
+          qty_done: number
+          report_id: string
+          unit: string | null
+          workers_count: number | null
+          zayavka_id: string | null
+        }
+        Insert: {
+          activity_name?: string | null
+          boq_item_id?: string | null
+          brigade_id?: string | null
+          brigade_name?: string | null
+          created_at?: string
+          equipment_hours?: number | null
+          equipment_name?: string | null
+          id?: string
+          note?: string | null
+          qty_done?: number
+          report_id: string
+          unit?: string | null
+          workers_count?: number | null
+          zayavka_id?: string | null
+        }
+        Update: {
+          activity_name?: string | null
+          boq_item_id?: string | null
+          brigade_id?: string | null
+          brigade_name?: string | null
+          created_at?: string
+          equipment_hours?: number | null
+          equipment_name?: string | null
+          id?: string
+          note?: string | null
+          qty_done?: number
+          report_id?: string
+          unit?: string | null
+          workers_count?: number | null
+          zayavka_id?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "daily_report_lines_boq_item_id_fkey"
+            columns: ["boq_item_id"]
+            isOneToOne: false
+            referencedRelation: "boq_items"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "daily_report_lines_brigade_id_fkey"
+            columns: ["brigade_id"]
+            isOneToOne: false
+            referencedRelation: "brigades"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "daily_report_lines_report_id_fkey"
+            columns: ["report_id"]
+            isOneToOne: false
+            referencedRelation: "daily_reports"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "daily_report_lines_zayavka_id_fkey"
+            columns: ["zayavka_id"]
+            isOneToOne: false
+            referencedRelation: "project_zayavka"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "daily_report_lines_zayavka_id_fkey"
+            columns: ["zayavka_id"]
+            isOneToOne: false
+            referencedRelation: "v_master_zayavka_remaining"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "daily_report_lines_zayavka_id_fkey"
+            columns: ["zayavka_id"]
+            isOneToOne: false
+            referencedRelation: "warehouse_balance"
+            referencedColumns: ["zayavka_id"]
+          },
+        ]
+      }
+      daily_reports: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          id: string
+          issues: string | null
+          notes: string | null
+          photo_url: string | null
+          project_id: string
+          report_date: string
+          reporter_name: string | null
+          telegram_user_id: number | null
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          issues?: string | null
+          notes?: string | null
+          photo_url?: string | null
+          project_id: string
+          report_date?: string
+          reporter_name?: string | null
+          telegram_user_id?: number | null
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          issues?: string | null
+          notes?: string | null
+          photo_url?: string | null
+          project_id?: string
+          report_date?: string
+          reporter_name?: string | null
+          telegram_user_id?: number | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "daily_reports_project_id_fkey"
+            columns: ["project_id"]
+            isOneToOne: false
+            referencedRelation: "projects"
             referencedColumns: ["id"]
           },
         ]
@@ -523,18 +774,21 @@ export type Database = {
           created_at: string
           icon: string | null
           id: string
+          kind: string
           name: string
         }
         Insert: {
           created_at?: string
           icon?: string | null
           id?: string
+          kind?: string
           name: string
         }
         Update: {
           created_at?: string
           icon?: string | null
           id?: string
+          kind?: string
           name?: string
         }
         Relationships: []
@@ -570,6 +824,7 @@ export type Database = {
           expense_date: string
           id: string
           import_hash: string | null
+          kind: string
           master_work_id: string | null
           paid_by: string | null
           payment_method: Database["public"]["Enums"]["payment_method"]
@@ -578,6 +833,7 @@ export type Database = {
           receipt_url: string | null
           source: string | null
           source_note: string | null
+          submission_row_id: string | null
           telegram_user_id: number | null
           unit: string | null
           unit_price: number | null
@@ -596,6 +852,7 @@ export type Database = {
           expense_date?: string
           id?: string
           import_hash?: string | null
+          kind?: string
           master_work_id?: string | null
           paid_by?: string | null
           payment_method?: Database["public"]["Enums"]["payment_method"]
@@ -604,6 +861,7 @@ export type Database = {
           receipt_url?: string | null
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
           unit?: string | null
           unit_price?: number | null
@@ -622,6 +880,7 @@ export type Database = {
           expense_date?: string
           id?: string
           import_hash?: string | null
+          kind?: string
           master_work_id?: string | null
           paid_by?: string | null
           payment_method?: Database["public"]["Enums"]["payment_method"]
@@ -630,6 +889,7 @@ export type Database = {
           receipt_url?: string | null
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
           unit?: string | null
           unit_price?: number | null
@@ -795,6 +1055,24 @@ export type Database = {
           },
         ]
       }
+      internal_secrets: {
+        Row: {
+          key: string
+          updated_at: string
+          value: string
+        }
+        Insert: {
+          key: string
+          updated_at?: string
+          value: string
+        }
+        Update: {
+          key?: string
+          updated_at?: string
+          value?: string
+        }
+        Relationships: []
+      }
       master_materials: {
         Row: {
           aliases: string[] | null
@@ -866,6 +1144,7 @@ export type Database = {
           received_at: string
           source: string | null
           source_note: string | null
+          submission_row_id: string | null
           supplier_id: string | null
           supplier_name: string | null
           telegram_user_id: number | null
@@ -894,6 +1173,7 @@ export type Database = {
           received_at?: string
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           supplier_id?: string | null
           supplier_name?: string | null
           telegram_user_id?: number | null
@@ -922,6 +1202,7 @@ export type Database = {
           received_at?: string
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           supplier_id?: string | null
           supplier_name?: string | null
           telegram_user_id?: number | null
@@ -1446,6 +1727,8 @@ export type Database = {
           name: string
           pm_name: string | null
           prorab_name: string | null
+          sheet_id: string | null
+          sheet_tab: string | null
           start_date: string | null
           status: string | null
           total_budget: number | null
@@ -1463,6 +1746,8 @@ export type Database = {
           name: string
           pm_name?: string | null
           prorab_name?: string | null
+          sheet_id?: string | null
+          sheet_tab?: string | null
           start_date?: string | null
           status?: string | null
           total_budget?: number | null
@@ -1480,6 +1765,8 @@ export type Database = {
           name?: string
           pm_name?: string | null
           prorab_name?: string | null
+          sheet_id?: string | null
+          sheet_tab?: string | null
           start_date?: string | null
           status?: string | null
           total_budget?: number | null
@@ -1506,6 +1793,225 @@ export type Database = {
         Update: {
           path?: string
           role?: Database["public"]["Enums"]["app_role"]
+        }
+        Relationships: []
+      }
+      sheet_category_map: {
+        Row: {
+          active: boolean
+          created_at: string
+          id: string
+          kind: string
+          sheet_category: string
+          source_category: string
+          updated_at: string
+        }
+        Insert: {
+          active?: boolean
+          created_at?: string
+          id?: string
+          kind: string
+          sheet_category: string
+          source_category: string
+          updated_at?: string
+        }
+        Update: {
+          active?: boolean
+          created_at?: string
+          id?: string
+          kind?: string
+          sheet_category?: string
+          source_category?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      sheet_legacy_links: {
+        Row: {
+          created_at: string
+          id: string
+          linked_by: string | null
+          linked_by_email: string | null
+          note: string | null
+          record_id: string
+          row_snapshot: Json | null
+          sheet_row: number
+          source_table: string
+          spreadsheet_id: string
+          tab: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          linked_by?: string | null
+          linked_by_email?: string | null
+          note?: string | null
+          record_id: string
+          row_snapshot?: Json | null
+          sheet_row: number
+          source_table: string
+          spreadsheet_id: string
+          tab: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          linked_by?: string | null
+          linked_by_email?: string | null
+          note?: string | null
+          record_id?: string
+          row_snapshot?: Json | null
+          sheet_row?: number
+          source_table?: string
+          spreadsheet_id?: string
+          tab?: string
+        }
+        Relationships: []
+      }
+      sheet_sync_ledger: {
+        Row: {
+          attempt_at: string
+          created_at: string
+          id: string
+          record_id: string
+          source_table: string
+          spreadsheet_id: string
+          status: string
+          tab: string
+          updated_at: string
+          write_token: string
+          written_at: string | null
+        }
+        Insert: {
+          attempt_at?: string
+          created_at?: string
+          id?: string
+          record_id: string
+          source_table: string
+          spreadsheet_id: string
+          status?: string
+          tab: string
+          updated_at?: string
+          write_token: string
+          written_at?: string | null
+        }
+        Update: {
+          attempt_at?: string
+          created_at?: string
+          id?: string
+          record_id?: string
+          source_table?: string
+          spreadsheet_id?: string
+          status?: string
+          tab?: string
+          updated_at?: string
+          write_token?: string
+          written_at?: string | null
+        }
+        Relationships: []
+      }
+      sheet_sync_queue: {
+        Row: {
+          attempts: number
+          created_at: string
+          error: string | null
+          ever_synced: boolean
+          id: string
+          needs_update: boolean
+          project_id: string | null
+          record_id: string
+          sheet_row: number | null
+          source_table: string
+          status: string
+          synced_at: string | null
+          update_seq: number
+        }
+        Insert: {
+          attempts?: number
+          created_at?: string
+          error?: string | null
+          ever_synced?: boolean
+          id?: string
+          needs_update?: boolean
+          project_id?: string | null
+          record_id: string
+          sheet_row?: number | null
+          source_table: string
+          status?: string
+          synced_at?: string | null
+          update_seq?: number
+        }
+        Update: {
+          attempts?: number
+          created_at?: string
+          error?: string | null
+          ever_synced?: boolean
+          id?: string
+          needs_update?: boolean
+          project_id?: string | null
+          record_id?: string
+          sheet_row?: number | null
+          source_table?: string
+          status?: string
+          synced_at?: string | null
+          update_seq?: number
+        }
+        Relationships: []
+      }
+      sheet_sync_state: {
+        Row: {
+          lock_owner: string | null
+          locked_until: string | null
+          next_row: number | null
+          singleton: boolean
+        }
+        Insert: {
+          lock_owner?: string | null
+          locked_until?: string | null
+          next_row?: number | null
+          singleton?: boolean
+        }
+        Update: {
+          lock_owner?: string | null
+          locked_until?: string | null
+          next_row?: number | null
+          singleton?: boolean
+        }
+        Relationships: []
+      }
+      sheet_sync_warnings: {
+        Row: {
+          detail: string | null
+          first_seen: string
+          id: string
+          kind: string
+          last_seen: string
+          occurrences: number
+          record_id: string
+          resolved: boolean
+          source_table: string
+        }
+        Insert: {
+          detail?: string | null
+          first_seen?: string
+          id?: string
+          kind: string
+          last_seen?: string
+          occurrences?: number
+          record_id: string
+          resolved?: boolean
+          source_table: string
+        }
+        Update: {
+          detail?: string | null
+          first_seen?: string
+          id?: string
+          kind?: string
+          last_seen?: string
+          occurrences?: number
+          record_id?: string
+          resolved?: boolean
+          source_table?: string
         }
         Relationships: []
       }
@@ -1601,6 +2107,21 @@ export type Database = {
           },
         ]
       }
+      telegram_processed_updates: {
+        Row: {
+          created_at: string
+          update_id: number
+        }
+        Insert: {
+          created_at?: string
+          update_id: number
+        }
+        Update: {
+          created_at?: string
+          update_id?: number
+        }
+        Relationships: []
+      }
       telegram_sessions: {
         Row: {
           chat_id: number
@@ -1628,6 +2149,27 @@ export type Database = {
           telegram_user_id?: number
           updated_at?: string
           username?: string | null
+        }
+        Relationships: []
+      }
+      user_bot_permissions: {
+        Row: {
+          button_key: string
+          created_at: string
+          id: string
+          user_id: string
+        }
+        Insert: {
+          button_key: string
+          created_at?: string
+          id?: string
+          user_id: string
+        }
+        Update: {
+          button_key?: string
+          created_at?: string
+          id?: string
+          user_id?: string
         }
         Relationships: []
       }
@@ -1792,6 +2334,7 @@ export type Database = {
           qty_done: number
           source: string | null
           source_note: string | null
+          submission_row_id: string | null
           telegram_user_id: number | null
           total_value: number | null
           unit: string | null
@@ -1815,6 +2358,7 @@ export type Database = {
           qty_done: number
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
           total_value?: number | null
           unit?: string | null
@@ -1838,6 +2382,7 @@ export type Database = {
           qty_done?: number
           source?: string | null
           source_note?: string | null
+          submission_row_id?: string | null
           telegram_user_id?: number | null
           total_value?: number | null
           unit?: string | null
@@ -2041,12 +2586,25 @@ export type Database = {
       }
     }
     Functions: {
+      assign_sheet_sync_rows: {
+        Args: { _queue_ids: string[] }
+        Returns: {
+          id: string
+          sheet_row: number
+        }[]
+      }
+      get_sheet_sync_next_row: { Args: never; Returns: number }
+      has_any_role: { Args: { _user_id: string }; Returns: boolean }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]
           _user_id: string
         }
         Returns: boolean
+      }
+      initialize_sheet_sync_next_row: {
+        Args: { _first_row: number }
+        Returns: number
       }
       log_trigger_error: {
         Args: {
@@ -2061,10 +2619,20 @@ export type Database = {
       }
       norm_name: { Args: { s: string }; Returns: string }
       recompute_zayavka_progress: { Args: { _zid: string }; Returns: undefined }
+      sheets_sync_url: { Args: never; Returns: string }
       show_limit: { Args: never; Returns: number }
       show_trgm: { Args: { "": string }; Returns: string[] }
       tg_user_has_role: {
         Args: { _role: Database["public"]["Enums"]["app_role"]; _tg_id: number }
+        Returns: boolean
+      }
+      try_lock_sheet_sync: {
+        Args: { _lease_seconds?: number; _owner: string }
+        Returns: boolean
+      }
+      unlock_sheet_sync: { Args: { _owner: string }; Returns: undefined }
+      user_can_access_project: {
+        Args: { _project_id: string }
         Returns: boolean
       }
     }
@@ -2092,7 +2660,7 @@ export type Database = {
       po_approval_status: "pending" | "approved" | "rejected"
       po_payment_type: "cash" | "bank_transfer"
       variation_status: "Pending" | "Approved" | "Rejected"
-      zayavka_kind: "material" | "work" | "equipment" | "extra"
+      zayavka_kind: "material" | "work" | "equipment" | "extra" | "ustalar"
       zayavka_status: "approved" | "pending" | "rejected"
       zayavka_workflow_status:
         | "draft"
@@ -2120,12 +2688,12 @@ export type Tables<
   DefaultSchemaTableNameOrOptions extends
     | keyof (DefaultSchema["Tables"] & DefaultSchema["Views"])
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
         DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -2149,11 +2717,11 @@ export type TablesInsert<
   DefaultSchemaTableNameOrOptions extends
     | keyof DefaultSchema["Tables"]
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -2174,11 +2742,11 @@ export type TablesUpdate<
   DefaultSchemaTableNameOrOptions extends
     | keyof DefaultSchema["Tables"]
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -2199,11 +2767,11 @@ export type Enums<
   DefaultSchemaEnumNameOrOptions extends
     | keyof DefaultSchema["Enums"]
     | { schema: keyof DatabaseWithoutInternals },
-  EnumName extends DefaultSchemaEnumNameOrOptions extends {
+  EnumName extends (DefaultSchemaEnumNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaEnumNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -2216,11 +2784,11 @@ export type CompositeTypes<
   PublicCompositeTypeNameOrOptions extends
     | keyof DefaultSchema["CompositeTypes"]
     | { schema: keyof DatabaseWithoutInternals },
-  CompositeTypeName extends PublicCompositeTypeNameOrOptions extends {
+  CompositeTypeName extends (PublicCompositeTypeNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"]
-    : never = never,
+    : never) = never,
 > = PublicCompositeTypeNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -2256,7 +2824,7 @@ export const Constants = {
       po_approval_status: ["pending", "approved", "rejected"],
       po_payment_type: ["cash", "bank_transfer"],
       variation_status: ["Pending", "Approved", "Rejected"],
-      zayavka_kind: ["material", "work", "equipment", "extra"],
+      zayavka_kind: ["material", "work", "equipment", "extra", "ustalar"],
       zayavka_status: ["approved", "pending", "rejected"],
       zayavka_workflow_status: [
         "draft",

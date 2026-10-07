@@ -1,7 +1,14 @@
 import { createServerFn } from "@tanstack/react-start";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-export const sendTelegramPing = createServerFn({ method: "POST" }).handler(async () => {
+export const sendTelegramPing = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data: adminRole } = await supabaseAdmin
+      .from("user_roles").select("role")
+      .eq("user_id", context.userId).eq("role", "admin").maybeSingle();
+    if (!adminRole) throw new Error("Faqat adminlar uchun");
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) return { ok: false, error: "TELEGRAM_BOT_TOKEN sozlanmagan", results: [] as any[] };
 

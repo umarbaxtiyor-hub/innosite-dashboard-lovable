@@ -1,5 +1,18 @@
 import { createServerFn } from "@tanstack/react-start";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+
+async function assertProjectAccess(userId: string, projectId: string) {
+  const { data: roleRows } = await supabaseAdmin
+    .from("user_roles").select("role").eq("user_id", userId);
+  const roles = (roleRows ?? []).map((r: any) => String(r.role));
+  const privileged = ["admin", "ceo", "direktor", "finans", "pm"];
+  if (roles.some((r) => privileged.includes(r))) return;
+  const { data: acc } = await supabaseAdmin
+    .from("user_project_access").select("project_id")
+    .eq("user_id", userId).eq("project_id", projectId).maybeSingle();
+  if (!acc) throw new Error("Forbidden: project access denied");
+}
 
 type ParsedItem = {
   kind: "material" | "work" | "expense" | "income";
@@ -18,6 +31,24 @@ type ParsedItem = {
   note: string | null;
   date: string | null;
 };
+
+function aiGatewayErrorMessage(status: number, body: string) {
+  let title = "AI tahlil vaqtincha ishlamayapti";
+  try {
+    const parsed = JSON.parse(body);
+    title = String(parsed?.message || parsed?.title || title);
+  } catch {
+    if (body.trim()) title = body.trim().slice(0, 120);
+  }
+
+  if (status === 402 || /not enough credits|payment_required/i.test(body)) {
+    return "AI krediti yetarli emas. Yozuvni qo'lda kiriting yoki kredit to'ldirilgandan keyin AI tahlilni qayta ishlating.";
+  }
+  if (status === 429) {
+    return "AI so'rovlari limiti oshib ketdi. Birozdan keyin qayta urinib ko'ring.";
+  }
+  return `AI xatolik (${status}): ${title}`;
+}
 
 // Cyrillic -> Latin (uz) transliteration for fuzzy matching
 const CYR: Record<string, string> = {
@@ -95,12 +126,18 @@ function parseMoney(text: string): number {
 }
 
 export const parseJurnalEntry = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator((input: { projectId: string; text: string }) => input)
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    await assertProjectAccess(context.userId, data.projectId);
     const { projectId, text } = data;
-    if (!text?.trim()) return { items: [] as ParsedItem[] };
+    if (!text?.trim()) return { items: [] as ParsedItem[], error: null as string | null };
 
     const sb = supabaseAdmin;
+
+    if (!process.env.LOVABLE_API_KEY) {
+      return { items: [] as ParsedItem[], error: "AI kaliti sozlanmagan. Yozuvni qo'lda kiriting yoki keyinroq qayta urinib ko'ring." };
+    }
 
     const { data: plan } = await sb
       .from("project_zayavka")
@@ -126,7 +163,7 @@ export const parseJurnalEntry = createServerFn({ method: "POST" })
     // Available expense categories
     const { data: cats } = await sb.from("expense_categories").select("name").order("name");
     const catNames = (cats ?? []).map((c: any) => c.name).filter(Boolean);
-    const catLine = catNames.length ? catNames.join(" | ") : "Bozorlik | Transport | Yordamchi | Xodimlar | Boshqa";
+    const catLine = catNames.length ? catNames.join(" | ") : "Qurilish materiali | Oziq-ovqat | Benzin | Salyarka | Texnika | Ofis/Lager | Oylik | Avans | Boshqa";
 
     const today = new Date().toISOString().slice(0, 10);
     const sys = `Sen qurilish jurnalga yozuv kirituvchi yordamchisan. Foydalanuvchi qisqa matn (yoki ovoz transkripsiyasi) yozadi — har bir tilga olingan element uchun bitta yozuv qaytarasan.
@@ -139,7 +176,7 @@ ${workList.map(fmt).join("\n") || "(bo'sh)"}
 
 QOIDALAR:
 - "kind": "material" | "work" | "expense" | "income".
-- KIRIM PUL (income): agar matnda "kirim", "pul oldim", "pul keldi", "prixod", "приход", "kassaga tushdi", "tushdi", "to'lov keldi", "investitsiya", "avans oldik", "mijoz to'ladi" kabi PUL KELGANINI bildiruvchi so'zlar bo'lsa — kind="income". Bu xarajat EMAS, bu kassaga pul kirimi. "category" maydoniga "Kirim" yozing. "payment_method": agar "bank", "plastik", "karta", "o'tkazma", "hisob" bo'lsa "Bank"; aks holda (naqd, qo'lga) "Naqd". qty=1, unit_price=summa, name=qisqa izoh (masalan "Mijozdan kirim", "Avans").
+- KIRIM PUL (income): agar matnda "kirim", "pul oldim", "pul keldi", "prixod", "приход", "kassaga tushdi", "tushdi", "to'lov keldi", "investitsiya", "avans oldik", "mijoz to'ladi" kabi PUL KELGANINI bildiruvchi so'zlar bo'lsa — kind="income". Bu xarajat EMAS, bu kassaga pul kirimi. "category" maydoniga to'lov usulini yozing: "Bank" yoki "Naqd" (shartnoma bo'yicha kirim bo'lsa "Shartnoma"). "payment_method": agar "bank", "plastik", "karta", "o'tkazma", "hisob" bo'lsa "Bank"; aks holda (naqd, qo'lga) "Naqd". qty=1, unit_price=summa, name=qisqa izoh (masalan "Mijozdan kirim", "Avans").
 - MUHIM: nomlarni TAQQOSLASHDA kirill/lotin farqi, kichik/katta harf, imlo xatolari va qisqartmalar bo'lishi mumkin. Masalan "грунтовка" = "gruntovka" = "guruntovka"; "крилча" = "krilcha" = "kirilcha"; "цемент"="sement"; "кирпич"="g'isht". Agar reja elementi bilan bir xil ma'noni bersa — albatta bog'lang va matched_zayavka_id ni shu elementning id'iga teng qiling.
 - Agar element rejadagi MATERIALga mos kelsa: kind="material", matched_zayavka_id=<id>, unit/unit_price rejadan (foydalanuvchi boshqa narx aytmasa).
 - Agar element rejadagi ISHga mos kelsa: kind="work", matched_zayavka_id=<id>, unit/unit_price rejadan.
@@ -168,7 +205,7 @@ QOIDALAR:
     });
     if (!res.ok) {
       const t = await res.text();
-      throw new Error(`AI xatolik (${res.status}): ${t.slice(0, 200)}`);
+      return { items: [] as ParsedItem[], error: aiGatewayErrorMessage(res.status, t) };
     }
     const j = await res.json();
     const txt: string = j?.choices?.[0]?.message?.content ?? "";
@@ -275,7 +312,7 @@ QOIDALAR:
         boq_code,
         master_material_id,
         master_work_id,
-        category: kind === "income" ? "Kirim" : (it?.category ?? null),
+        category: kind === "income" ? (payment_method === "Bank" ? "Bank" : "Naqd") : (it?.category ?? null),
         payment_method,
         name: String(it?.name ?? "").trim() || (kind === "income" ? "Kirim" : ""),
         unit,
@@ -287,5 +324,5 @@ QOIDALAR:
       } as ParsedItem;
     }) as ParsedItem[];
 
-    return { items };
+    return { items, error: null as string | null };
   });

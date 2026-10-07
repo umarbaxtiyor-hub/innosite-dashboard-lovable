@@ -1,12 +1,13 @@
 import { Outlet, Link, createRootRoute, HeadContent, Scripts, useRouterState, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { MobileTopNav } from "@/components/MobileTopNav";
 import { PwaInstaller } from "@/components/PwaInstaller";
 
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { HeaderActions } from "@/components/HeaderActions";
 import { supabase } from "@/integrations/supabase/client";
 import { Loader2 } from "lucide-react";
 import { useCurrentRoles } from "@/hooks/use-current-roles";
@@ -105,13 +106,18 @@ function RootShell({ children }: { children: React.ReactNode }) {
 
 
 function RootComponent() {
+  useEffect(() => {
+    return focusManager.setEventListener(() => () => {});
+  }, []);
+
   const [qc] = useState(() => new QueryClient({
     defaultOptions: {
       queries: {
-        staleTime: 60_000,
-        gcTime: 5 * 60_000,
+        staleTime: Infinity,
+        gcTime: Infinity,
         refetchOnWindowFocus: false,
         refetchOnReconnect: false,
+        refetchOnMount: false,
         retry: 1,
       },
     },
@@ -137,6 +143,7 @@ function RootComponent() {
                     <span className="text-3xl sm:text-4xl font-bold tracking-tight text-foreground">site</span>
                   </Link>
                   <div className="ml-auto flex items-center gap-2">
+                    <HeaderActions />
                     <ThemeToggle />
                     <Link to="/auth" className="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted">Kirish</Link>
                   </div>
@@ -207,14 +214,17 @@ function AuthGate({ children }: { children: (authed: boolean) => React.ReactNode
   useEffect(() => {
     let active = true;
     const SESSION_FLAG = "innosite.session.active";
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
       if (!active) return;
+      // Faqat login/logoutga reaksiya qilamiz. TOKEN_REFRESHED, USER_UPDATED,
+      // INITIAL_SESSION va boshqa hodisalar tabga qaytganda re-render qilmasin.
+      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT") return;
       if (session?.user) {
         try { sessionStorage.setItem(SESSION_FLAG, "1"); } catch {}
-        setStatus("authed");
+        setStatus((prev) => (prev === "authed" ? prev : "authed"));
       } else {
         try { sessionStorage.removeItem(SESSION_FLAG); } catch {}
-        setStatus("guest");
+        setStatus((prev) => (prev === "guest" ? prev : "guest"));
       }
     });
     (async () => {

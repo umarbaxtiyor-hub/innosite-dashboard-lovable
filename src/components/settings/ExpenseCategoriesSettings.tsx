@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Tag, Plus, Trash2, Loader2 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { supabase } from "@/integrations/supabase/client";
@@ -8,18 +9,18 @@ import { toast } from "sonner";
 type Category = { id: string; name: string; icon: string | null };
 
 const SUGGESTED_EMOJIS: { emoji: string; label: string }[] = [
+  { emoji: "🧑", label: "Oylik (xodim)" },
   { emoji: "🛒", label: "Oziq-ovqat" },
-  { emoji: "⛽", label: "Yoqilg'i" },
-  { emoji: "🚚", label: "Transport" },
+  { emoji: "⛽", label: "Benzin" },
+  { emoji: "🛢️", label: "Salyarka" },
+  { emoji: "🚜", label: "Texnika" },
   { emoji: "🔧", label: "Ta'mirlash" },
   { emoji: "📦", label: "Materiallar" },
   { emoji: "🧱", label: "Qurilish" },
   { emoji: "🛠️", label: "Asbob-uskuna" },
-  { emoji: "👷", label: "Ish haqi" },
+  { emoji: "👷", label: "Avans (usta)" },
+  { emoji: "🏢", label: "Ofis/Lager" },
   { emoji: "💡", label: "Kommunal" },
-  { emoji: "📱", label: "Aloqa" },
-  { emoji: "🏢", label: "Ofis" },
-  { emoji: "📄", label: "Hujjatlar" },
   { emoji: "🧾", label: "Soliq" },
   { emoji: "🏦", label: "Bank" },
   { emoji: "💰", label: "Boshqa to'lov" },
@@ -36,6 +37,7 @@ export function ExpenseCategoriesSettings() {
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("");
   const [adding, setAdding] = useState(false);
+  const qc = useQueryClient();
 
   async function load() {
     setLoading(true);
@@ -59,6 +61,7 @@ export function ExpenseCategoriesSettings() {
     setName(""); setIcon("");
     toast.success("Kategoriya qo'shildi");
     load();
+    qc.invalidateQueries({ queryKey: ["expense_categories_list"] });
   }
 
   async function del(id: string, n: string) {
@@ -67,6 +70,7 @@ export function ExpenseCategoriesSettings() {
     if (error) { toast.error(error.message); return; }
     toast.success("O'chirildi");
     load();
+    qc.invalidateQueries({ queryKey: ["expense_categories_list"] });
   }
 
   return (

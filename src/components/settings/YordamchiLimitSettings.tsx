@@ -51,14 +51,14 @@ export function YordamchiLimitSettings() {
       if (existing) {
         const { error } = await supabase
           .from("project_zayavka")
-          .update({ unit_price: limit, qty: 1, total: limit })
+          .update({ unit_price: limit, qty: 1 })
           .eq("id", existing.id);
         if (error) throw error;
       } else {
         const { error } = await supabase.from("project_zayavka").insert({
           project_id: activeProjectId,
           kind: "equipment",
-          name: "Yordamchi xarajatlar limiti",
+          name: "Operatsion xarajatlar limiti",
           unit: "so'm",
           qty: 1,
           unit_price: limit,
@@ -79,7 +79,7 @@ export function YordamchiLimitSettings() {
     <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
       <div className="mb-3 flex items-center gap-2">
         <Wallet className="h-5 w-5 text-primary" />
-        <h3 className="font-semibold">Yordamchi xarajatlar limiti</h3>
+        <h3 className="font-semibold">Operatsion xarajatlar limiti</h3>
       </div>
       {!activeProjectId ? (
         <p className="text-sm text-muted-foreground">Loyiha tanlang.</p>

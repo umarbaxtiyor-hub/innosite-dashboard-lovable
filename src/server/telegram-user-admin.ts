@@ -4,19 +4,14 @@
 // Hech qanday yangi jadval qo'shilmaydi: pending so'rov requester'ning
 // telegram_sessions.data.urq ichida saqlanadi.
 
-import { createClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { ALL_ROLES, ROLE_LABELS, type AppRole } from "@/lib/permissions";
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 
-function sb() {
-  return createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-}
+const sb = () => supabaseAdmin as unknown as SupabaseClient;
 
 async function tg(method: string, body: any) {
   const r = await fetch(`${TG_API}/${method}`, {
@@ -104,13 +99,75 @@ function genPin(): string {
   return pins[Math.floor(Math.random() * pins.length)];
 }
 
+// Yangi foydalanuvchi uchun tanlanadigan lavozimlar
+const JOIN_ROLES = {
+  admin: "admin",
+  ceo: "ceo",
+  direktor: "direktor",
+  finans: "finans",
+  pm: "pm",
+  prorab: "prorab",
+  tamin: "taminotchi",
+  ombor: "omborchi",
+  buxg: "buxgalter",
+  kuz: "kuzatuvchi",
+} as const satisfies Record<string, AppRole>;
+const JOIN_ROLE_LABELS: Record<keyof typeof JOIN_ROLES, string> = {
+  admin: "👑 Admin",
+  ceo: "🏢 CEO",
+  direktor: "🎩 Direktor",
+  finans: "💰 Finans",
+  pm: "📊 PM",
+  prorab: "👷 Prorab",
+  tamin: "🚚 Ta'minotchi",
+  ombor: "📦 Omborchi",
+  buxg: "🧮 Buxalter",
+  kuz: "👁 Kuzatuvchi",
+};
+
+const BOT_BUTTONS = [
+  { key: "project", label: "📊 Loyiha" },
+  { key: "fuel", label: "⛽ Salyarka" },
+  { key: "ledger", label: "📒 Daftar" },
+  { key: "dpr", label: "📄 DPR" },
+  { key: "hr", label: "👥 HR" },
+  { key: "innoai", label: "✨ Fina" },
+] as const;
+
+async function grantDefaultBotButtons(userId: string, role: AppRole) {
+  const keys = role === "ceo"
+    ? ["innoai"]
+    : role === "admin" || role === "finans"
+      ? BOT_BUTTONS.map((button) => button.key)
+      : ["ledger"];
+  if (!keys.length) return;
+  await sb().from("user_bot_permissions").upsert(
+    keys.map((button_key) => ({ user_id: userId, button_key })),
+    { onConflict: "user_id,button_key" },
+  );
+}
+
+function roleKeyboardRows(requesterUid: number) {
+  const keys = Object.keys(JOIN_ROLES) as (keyof typeof JOIN_ROLES)[];
+  const rows: any[] = [];
+  for (let i = 0; i < keys.length; i += 2) {
+    rows.push(
+      keys.slice(i, i + 2).map((k) => ({
+        text: JOIN_ROLE_LABELS[k],
+        callback_data: `urq:rl:${requesterUid}:${k}`,
+      })),
+    );
+  }
+  return rows;
+}
+
 function phoneDigits(v: any): string {
   return String(v ?? "").replace(/\D/g, "");
 }
 
 async function getRequesterSession(uid: number) {
   const { data } = await sb()
-    .from("telegram_sessions").select("*").eq("telegram_user_id", uid).maybeSingle();
+    .from("telegram_sessions").select("chat_id,telegram_user_id,username,flow,step,data").eq("telegram_user_id", uid).maybeSingle();
   return data as any | null;
 }
 
@@ -135,19 +192,62 @@ async function notifyAllAdmins(text: string, reply_markup?: any) {
   }
 }
 
-// ---------- /sorov flow ----------
+// ---------- Taklif havolalari (bir martalik, 7 kun) ----------
+const BOT_USERNAME = "Finance_tizim_bot";
+type Invite = { c: string; exp: number };
+async function loadInvites(): Promise<Invite[]> {
+  const { data } = await sb().from("app_settings").select("value").eq("key", "invite_codes").maybeSingle();
+  try {
+    const arr = JSON.parse((data as any)?.value ?? "[]");
+    return (Array.isArray(arr) ? arr : []).filter((i: Invite) => i?.c && i.exp > Date.now());
+  } catch { return []; }
+}
+async function saveInvites(list: Invite[]) {
+  await sb().from("app_settings").upsert({ key: "invite_codes", value: JSON.stringify(list) } as any, { onConflict: "key" });
+}
+export async function createInviteLink(): Promise<string> {
+  const bytes = crypto.getRandomValues(new Uint8Array(9));
+  const c = Array.from(bytes, (b) => b.toString(36).padStart(2, "0")).join("").slice(0, 14);
+  const list = await loadInvites();
+  list.push({ c, exp: Date.now() + 7 * 864e5 });
+  await saveInvites(list);
+  return `https://t.me/${BOT_USERNAME}?start=${c}`;
+}
+async function consumeInvite(code: string): Promise<boolean> {
+  if (!code) return false;
+  const list = await loadInvites();
+  const i = list.findIndex((x) => x.c === code);
+  if (i < 0) return false;
+  list.splice(i, 1);
+  await saveInvites(list);
+  return true;
+}
+
+// ---------- /start (faqat taklif havolasi orqali) ----------
 export async function tryStartJoinRequest(chat_id: number, uid: number, username: string | null, text: string): Promise<boolean> {
-  const cmd = (text ?? "").trim().toLowerCase().split(/\s+/)[0]?.split("@")[0];
-  if (cmd !== "/sorov") return false;
-  // mavjudligini tekshirish
+  const parts = (text ?? "").trim().split(/\s+/);
+  const cmd = parts[0]?.toLowerCase().split("@")[0];
+  const isStart = cmd === "/start";
+  if (cmd !== "/sorov" && !isStart) return false;
   const { data: prof } = await sb()
     .from("profiles").select("id,full_name,is_active").eq("telegram_user_id", uid).maybeSingle();
   if (prof) {
+    if (isStart) return false;
     if (prof.is_active === false) {
       await send(chat_id, "⛔️ Sizning hisobingiz to'xtatilgan. Administratorga murojaat qiling.");
     } else {
       await send(chat_id, `✅ Siz allaqachon ro'yxatdasiz: <b>${prof.full_name ?? "—"}</b>.\n/start ni bosing.`);
     }
+    return true;
+  }
+  const s = await getRequesterSession(uid);
+  if (s?.flow === "urq_wait") {
+    await send(chat_id, "⏳ So'rovingiz administrator tasdiqlashini kutmoqda.");
+    return true;
+  }
+  // Faqat haqiqiy taklif havolasi bilan kelganlarga ochiq
+  if (!isStart || !(await consumeInvite(parts[1] ?? ""))) {
+    await send(chat_id, "🔒 Bu bot yopiq. Kirish faqat administrator yuborgan havola orqali.");
     return true;
   }
   await setRequesterFlow(chat_id, uid, username, "urq_name", {
@@ -259,11 +359,34 @@ async function userDetailMenu(user_id: string) {
         { text: "🗑 O'chirish", callback_data: `usr:d:${user_id}` },
       ],
       [{ text: "📁 Loyihalar (ruxsat)", callback_data: `usr:p:${user_id}` }],
+      [{ text: "🔘 Bot tugmalari", callback_data: `usr:b:${user_id}` }],
       ...roleBtns,
       [{ text: "◀️ Ro'yxatga", callback_data: "usr:list" }],
     ],
   };
   return { text, markup };
+}
+
+async function userButtonsMenu(user_id: string) {
+  const supa = sb();
+  const { data: profile } = await supa.from("profiles").select("full_name").eq("id", user_id).maybeSingle();
+  const { data: permissions } = await supa
+    .from("user_bot_permissions")
+    .select("button_key")
+    .eq("user_id", user_id);
+  const enabled = new Set((permissions ?? []).map((row: any) => String(row.button_key)));
+  const rows: any[] = [];
+  for (let i = 0; i < BOT_BUTTONS.length; i += 2) {
+    rows.push(BOT_BUTTONS.slice(i, i + 2).map((button) => ({
+      text: `${enabled.has(button.key) ? "✅" : "▫️"} ${button.label}`,
+      callback_data: `usr:bt:${uuidToShort(user_id)}:${button.key}`,
+    })));
+  }
+  rows.push([{ text: "◀️ Orqaga", callback_data: `usr:m:${user_id}` }]);
+  return {
+    text: `<b>🔘 Bot tugmalari</b>\n👤 ${(profile as any)?.full_name ?? "—"}\n\n✅ — ko'rinadi, ▫️ — ko'rinmaydi.\nKerakli tugmani bosing.`,
+    markup: { inline_keyboard: rows },
+  };
 }
 
 async function userProjectsMenu(user_id: string) {
@@ -299,11 +422,136 @@ async function userProjectsMenu(user_id: string) {
   return { text: `${head}${lines}`, markup: { inline_keyboard: buttons } };
 }
 
+// ---------- 🏗 Loyihalar (admin) ----------
+async function projectsMenu() {
+  const { data } = await sb()
+    .from("projects").select("id,name,code,sheet_id,status").order("name", { ascending: true });
+  const list = (data ?? []) as any[];
+  const lines = list.length
+    ? list.map((p, i) => `${i + 1}. ${p.sheet_id ? "📗" : "▫️"} <b>${p.name}</b>${p.code ? ` (${p.code})` : ""}`).join("\n")
+    : "Hozircha loyiha yo'q.";
+  const buttons = list.slice(0, 30).map((p) => [{
+    text: `${p.sheet_id ? "📗" : "▫️"} ${String(p.name).slice(0, 30)}`,
+    callback_data: `prj:m:${uuidToShort(p.id)}`,
+  }]);
+  buttons.push([{ text: "➕ Yangi loyiha", callback_data: "prj:new" }]);
+  buttons.push([{ text: "📊 Bosh jadval (barcha loyihalar)", callback_data: "prj:all" }]);
+  return {
+    text: `<b>🏗 Loyihalar (${list.length})</b>\n\n${lines}\n\n📗 — Google Sheet biriktirilgan`,
+    markup: { inline_keyboard: buttons },
+  };
+}
+
+async function projectDetail(project_id: string) {
+  const { data: p } = await sb()
+    .from("projects").select("id,name,code,location,status,sheet_id,sheet_tab").eq("id", project_id).maybeSingle();
+  if (!p) return null;
+  const pr = p as any;
+  const text =
+    `<b>🏗 ${pr.name}</b>\n` +
+    `🔖 Kod: ${pr.code ?? "—"}\n` +
+    `📍 ${pr.location ?? "—"}\n` +
+    `📗 Sheet: <code>${pr.sheet_id ?? "—"}</code>\n` +
+    `📑 Varaq: ${pr.sheet_tab ?? "Master_Data"}`;
+  const markup = {
+    inline_keyboard: [
+      [{ text: "📗 Sheet ID biriktirish", callback_data: `prj:sid:${uuidToShort(project_id)}` }],
+      [{ text: "📑 Varaq nomi", callback_data: `prj:tab:${uuidToShort(project_id)}` }],
+      [{ text: "◀️ Loyihalarga", callback_data: "prj:list" }],
+    ],
+  };
+  return { text, markup };
+}
+
+async function setAdminFlow(chat_id: number, uid: number, flow: string | null, extra: any) {
+  const s = await getRequesterSession(uid);
+  await sb().from("telegram_sessions").upsert({
+    chat_id, telegram_user_id: uid, username: s?.username ?? null,
+    flow, step: null, data: { ...(s?.data ?? {}), padm: extra },
+    updated_at: new Date().toISOString(),
+  });
+}
+
+/** Admin loyiha qo'shish / sheet biriktirish matn oqimi */
+export async function tryHandleAdminFlow(chat_id: number, uid: number, msg: any): Promise<boolean> {
+  const s = await getRequesterSession(uid);
+  const flow = s?.flow;
+  if (flow !== "padm_name" && flow !== "padm_code" && flow !== "padm_sid" && flow !== "padm_tab") return false;
+  if (!(await isAdmin(uid))) return false;
+  const text: string = String(msg?.text ?? "").trim();
+  if (!text) return false;
+  if (/^\/(bekor|cancel|start|menu)$/i.test(text)) {
+    await setAdminFlow(chat_id, uid, null, null);
+    await send(chat_id, "↩️ Bekor qilindi.");
+    return true;
+  }
+  const padm = s?.data?.padm ?? {};
+
+  if (flow === "padm_name") {
+    await setAdminFlow(chat_id, uid, "padm_code", { ...padm, name: text });
+    await send(chat_id, `✅ Nomi: <b>${text}</b>\n\nEndi qisqa kodini yozing (masalan: <code>PV</code>). Kerak bo'lmasa <code>-</code> yuboring.`);
+    return true;
+  }
+  if (flow === "padm_code") {
+    const code = text === "-" ? String(padm.name ?? "LOY").slice(0, 6).toUpperCase() : text.toUpperCase();
+    const { data, error } = await sb().from("projects")
+      .insert({ name: padm.name, code, status: "active" }).select("id").maybeSingle();
+    await setAdminFlow(chat_id, uid, null, null);
+    if (error || !data) {
+      await send(chat_id, `⚠️ Xato: ${error?.message ?? "loyiha yaratilmadi"}`);
+      return true;
+    }
+    const d = await projectDetail((data as any).id);
+    await send(chat_id, `✅ Loyiha yaratildi.\n\n${d?.text ?? ""}`, d?.markup);
+    return true;
+  }
+  if (flow === "padm_sid" || flow === "padm_tab") {
+    const pid = padm.project_id as string;
+    // To'liq havola berilsa, ID ni ajratib olamiz
+    const val = flow === "padm_sid"
+      ? (text.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)?.[1] ?? text)
+      : text;
+    await sb().from("projects")
+      .update(flow === "padm_sid" ? { sheet_id: val } : { sheet_tab: val })
+      .eq("id", pid);
+    await setAdminFlow(chat_id, uid, null, null);
+    const d = await projectDetail(pid);
+    await send(chat_id, `✅ Saqlandi.\n\n${d?.text ?? ""}`, d?.markup);
+    return true;
+  }
+  return false;
+}
+
 export async function tryHandleAdminCommand(chat_id: number, uid: number, text: string): Promise<boolean> {
   const cmd = (text ?? "").trim().toLowerCase().split(/\s+/)[0]?.split("@")[0];
-  if (cmd !== "/xodimlar" && cmd !== "/users") return false;
+  const isUsers = cmd === "/xodimlar" || cmd === "/users";
+  const isProjects = cmd === "/loyihalar" || cmd === "/projects";
+  const isPanel = cmd === "/admin";
+  const isInvite = cmd === "/taklif" || /^(🔗\s*)?taklif havolasi$/i.test((text ?? "").trim());
+  if (!isUsers && !isProjects && !isPanel && !isInvite) return false;
   if (!(await isAdmin(uid))) {
+    if (isProjects) return false; // oddiy foydalanuvchida eski xatti-harakat qoladi
     await send(chat_id, "🚫 Bu buyruq faqat admin uchun.");
+    return true;
+  }
+  if (isInvite) {
+    const link = await createInviteLink();
+    await send(chat_id, `🔗 <b>Taklif havolasi</b> (bir martalik, 7 kun amal qiladi):\n\n${link}\n\nShu havolani yangi xodimga yuboring.`);
+    return true;
+  }
+  if (isPanel) {
+    await send(chat_id, "<b>⚙️ Admin panel</b>", {
+      inline_keyboard: [
+        [{ text: "🏗 Loyihalar", callback_data: "prj:list" }],
+        [{ text: "👥 Xodimlar", callback_data: "usr:list" }],
+        [{ text: "🔗 Taklif havolasi", callback_data: "inv:new" }],
+      ],
+    });
+    return true;
+  }
+  if (isProjects) {
+    const r = await projectsMenu();
+    await send(chat_id, r.text, r.markup);
     return true;
   }
   const { text: t, markup } = await listUsersText();
@@ -318,6 +566,69 @@ export async function tryHandleCallback(cb: any): Promise<boolean> {
   const message_id = cb.message?.message_id;
   const uid = cb.from?.id ?? chat_id;
   if (!chat_id) return false;
+
+  // ===== Kirish so'rovi: lavozim tanlash =====
+  if (data.startsWith("urq:rl:")) {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫 Faqat admin"); return true; }
+    const parts = data.split(":");
+    const requesterUid = Number(parts[2]);
+    const pick = parts[3] as keyof typeof JOIN_ROLES;
+    const role = JOIN_ROLES[pick];
+    if (!role) { await answerCb(cb.id, "Noto'g'ri lavozim"); return true; }
+    const rs = await getRequesterSession(requesterUid);
+    const urq = rs?.data?.urq;
+    if (!urq?.full_name || !urq?.phone) {
+      await editText(chat_id, message_id, "⚠️ So'rov topilmadi yoki eskirgan.");
+      await answerCb(cb.id);
+      return true;
+    }
+
+    const pin = genPin();
+    const supa = sb();
+    const res = await createUserWithUniqueEmail(urq.full_name, `pin${pin}`, {
+      full_name: urq.full_name,
+      phone: `+${urq.phone}`,
+    });
+    if ("error" in res) {
+      await editText(chat_id, message_id, `⚠️ Xato: ${res.error}`);
+      await answerCb(cb.id);
+      return true;
+    }
+    const newId = res.user_id;
+    const email = res.email;
+    await supa.from("profiles").upsert({
+      id: newId,
+      full_name: urq.full_name,
+      phone: `+${urq.phone}`,
+      telegram_user_id: requesterUid,
+      telegram_username: rs.username ?? null,
+      is_active: true,
+    }, { onConflict: "id" });
+    await supa.from("profiles")
+      .update({ telegram_user_id: null })
+      .eq("telegram_user_id", requesterUid)
+      .neq("id", newId);
+    await supa.from("user_roles").delete().eq("user_id", newId);
+    await supa.from("user_roles").insert({ user_id: newId, role });
+    await grantDefaultBotButtons(newId, role);
+
+    await setRequesterFlow(Number(rs.chat_id), requesterUid, rs.username ?? null, null, { ...(rs.data ?? {}), urq: null });
+    await editText(
+      chat_id, message_id,
+      `✅ Tasdiqlandi.\n👤 ${urq.full_name}\n💼 ${JOIN_ROLE_LABELS[pick]}\n📧 <code>${email}</code>\n🔑 PIN: <code>${pin}</code>\n\n⬇️ Endi loyihalarni biriktiring:`,
+    );
+    const pm = await userProjectsMenu(newId);
+    await send(chat_id, pm.text, pm.markup);
+    const bm = await userButtonsMenu(newId);
+    await send(chat_id, bm.text, bm.markup);
+    try {
+      await send(Number(rs.chat_id),
+        `✅ <b>Tizimga kirish ruxsati berildi!</b>\n\n👤 ${urq.full_name}\n💼 ${JOIN_ROLE_LABELS[pick]}\n📧 Login: <code>${email}</code>\n🔑 PIN-kod: <code>${pin}</code>\n\n/start ni bosing.`
+      );
+    } catch {}
+    await answerCb(cb.id, "Tasdiqlandi");
+    return true;
+  }
 
   // ===== Kirish so'rovi: tasdiqlash/rad =====
   if (data.startsWith("urq:ok:") || data.startsWith("urq:no:")) {
@@ -339,44 +650,73 @@ export async function tryHandleCallback(cb: any): Promise<boolean> {
       return true;
     }
 
-    // Tasdiqlash → akkaunt yaratish (login = ism, kerak bo'lsa raqam qo'shiladi)
-    const pin = genPin();
-    const password = `pin${pin}`;
-    const supa = sb();
-    const res = await createUserWithUniqueEmail(urq.full_name, password, {
-      full_name: urq.full_name,
-      phone: `+${urq.phone}`,
-    });
-    if ("error" in res) {
-      await editText(chat_id, message_id, `⚠️ Xato: ${res.error}`);
-      await answerCb(cb.id);
-      return true;
-    }
-    const newId = res.user_id;
-    const email = res.email;
-    // Profil triggeri bilan poyga bo'lmasligi uchun upsert
-    await supa.from("profiles").upsert({
-      id: newId,
-      full_name: urq.full_name,
-      phone: `+${urq.phone}`,
-      telegram_user_id: requesterUid,
-      telegram_username: rs.username ?? null,
-      is_active: true,
-    }, { onConflict: "id" });
-    // Eski telegram_user_id boshqa profilda bo'lsa — uni tozalaymiz
-    await supa.from("profiles")
-      .update({ telegram_user_id: null })
-      .eq("telegram_user_id", requesterUid)
-      .neq("id", newId);
+    // Tasdiqlash → avval lavozim tanlanadi
+    await editText(
+      chat_id, message_id,
+      `👤 <b>${urq.full_name}</b>\n📞 +${urq.phone}\n\n💼 <b>Lavozimni tanlang:</b>`,
+      {
+        inline_keyboard: [
+          ...roleKeyboardRows(requesterUid),
+          [{ text: "❌ Rad etish", callback_data: `urq:no:${requesterUid}` }],
+        ],
+      },
+    );
+    await answerCb(cb.id);
+    return true;
+  }
 
-    await setRequesterFlow(Number(rs.chat_id), requesterUid, rs.username ?? null, null, { ...(rs.data ?? {}), urq: null });
-    await editText(chat_id, message_id, `✅ Tasdiqlandi va akkaunt yaratildi.\n👤 ${urq.full_name}\n📧 <code>${email}</code>\n🔑 PIN: <code>${pin}</code>`);
-    try {
-      await send(Number(rs.chat_id),
-        `✅ <b>Tizimga kirish ruxsati berildi!</b>\n\n👤 ${urq.full_name}\n📧 Login: <code>${email}</code>\n🔑 PIN-kod: <code>${pin}</code>\n\nWeb-saytga kiring va shu PIN bilan tizimga kiring. /start ni bosing.`
-      );
-    } catch {}
-    await answerCb(cb.id, "Tasdiqlandi");
+  // ===== 🏗 Loyihalar (admin) =====
+  if (data === "prj:all") {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    await answerCb(cb.id);
+    await editText(chat_id, message_id,
+      "<b>📊 Bosh jadval</b>\n\nBosh jadvalga yozish to'xtatilgan. Barcha kirim/chiqimlar endi faqat Master_Data jadvaliga tushadi. Eski ma'lumotlar o'chirilmagan.",
+      { inline_keyboard: [[{ text: "◀️ Loyihalarga", callback_data: "prj:list" }]] });
+    return true;
+  }
+  if (data === "prj:list") {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const r = await projectsMenu();
+    await editText(chat_id, message_id, r.text, r.markup);
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data === "prj:new") {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    await setAdminFlow(chat_id, uid, "padm_name", {});
+    await send(chat_id, "🏗 <b>Yangi loyiha</b>\n\nLoyiha nomini yozing:");
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data.startsWith("prj:m:")) {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const pid = shortToUuid(data.slice(6));
+    const r = await projectDetail(pid);
+    if (!r) { await answerCb(cb.id, "Topilmadi"); return true; }
+    await editText(chat_id, message_id, r.text, r.markup);
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data.startsWith("prj:sid:") || data.startsWith("prj:tab:")) {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const isSid = data.startsWith("prj:sid:");
+    const pid = shortToUuid(data.slice(8));
+    await setAdminFlow(chat_id, uid, isSid ? "padm_sid" : "padm_tab", { project_id: pid });
+    await send(
+      chat_id,
+      isSid
+        ? "📗 Google Sheet <b>havolasini</b> yoki ID sini yuboring:"
+        : "📑 Varaq (tab) nomini yozing, masalan: <code>Master_Data</code>",
+    );
+    await answerCb(cb.id);
+    return true;
+  }
+
+  if (data === "inv:new") {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const link = await createInviteLink();
+    await send(chat_id, `🔗 <b>Taklif havolasi</b> (bir martalik, 7 kun amal qiladi):\n\n${link}\n\nShu havolani yangi xodimga yuboring.`);
+    await answerCb(cb.id);
     return true;
   }
 
@@ -424,6 +764,36 @@ export async function tryHandleCallback(cb: any): Promise<boolean> {
     const r = await userProjectsMenu(user_id);
     await editText(chat_id, message_id, r.text, r.markup);
     await answerCb(cb.id);
+    return true;
+  }
+  if (data.startsWith("usr:b:")) {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const user_id = data.slice(6);
+    const r = await userButtonsMenu(user_id);
+    await editText(chat_id, message_id, r.text, r.markup);
+    await answerCb(cb.id);
+    return true;
+  }
+  if (data.startsWith("usr:bt:")) {
+    if (!(await isAdmin(uid))) { await answerCb(cb.id, "🚫"); return true; }
+    const parts = data.split(":");
+    const user_id = shortToUuid(parts[2]);
+    const buttonKey = parts[3];
+    if (!BOT_BUTTONS.some((button) => button.key === buttonKey)) {
+      await answerCb(cb.id, "Noto'g'ri tugma");
+      return true;
+    }
+    const supa = sb();
+    const { data: existing } = await supa.from("user_bot_permissions")
+      .select("id").eq("user_id", user_id).eq("button_key", buttonKey).maybeSingle();
+    if (existing) {
+      await supa.from("user_bot_permissions").delete().eq("user_id", user_id).eq("button_key", buttonKey);
+    } else {
+      await supa.from("user_bot_permissions").insert({ user_id, button_key: buttonKey });
+    }
+    const r = await userButtonsMenu(user_id);
+    await editText(chat_id, message_id, r.text, r.markup);
+    await answerCb(cb.id, existing ? "Olib tashlandi" : "Berildi");
     return true;
   }
   if (data.startsWith("usr:pt:")) {

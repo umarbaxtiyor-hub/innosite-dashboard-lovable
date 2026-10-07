@@ -1,0 +1,1 @@
+ALTER TABLE public.user_bot_permissions DROP CONSTRAINT user_bot_permissions_user_id_fkey;

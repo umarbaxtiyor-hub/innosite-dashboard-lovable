@@ -1,0 +1,14 @@
+- [x] P0: Telegram update_id dedup + error logging
+- [x] P0: sync webhook secret moved out of source (internal_secrets)
+- [ ] Rotate CEO_REPORT_SECRET (old value leaked in old migration; also used by ceo-daily-report cron) — user action
+- [x] P1: fuel/HR/DPR idempotent writes
+- [x] P1: aiAllowedByChat — reviewed, refilled from DB per message
+- [x] P1: 4 processing queue rows — left untouched (consolidated target not yet written)
+- [x] P1: duplicate expenses audit saved (no deletion)
+- [x] Legacy ID reconciliation (preview + manual exact-UUID link)
+- [x] Category mapping table + warnings
+- [x] Sync Monitor page
+- [x] Bot outbox (DB-first fuel/HR/DPR)
+- [x] Daily summary + sync health in CEO report
+- [x] CEO dashboard, AI Control Center
+- [ ] HSE/QA-QC metrics — no data source in system yet

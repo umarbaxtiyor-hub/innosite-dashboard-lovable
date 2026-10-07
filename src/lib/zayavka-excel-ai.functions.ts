@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
 type RawRow = Record<string, any>;
 
@@ -73,8 +74,16 @@ function safeParseJson(raw: string): any {
 }
 
 export const normalizeZayavkaRows = createServerFn({ method: "POST" })
-  .inputValidator((input: { rows: RawRow[] }) => input)
-  .handler(async ({ data }) => {
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: { rows: RawRow[] }) => {
+    if (!input || !Array.isArray(input.rows)) throw new Error("rows majburiy");
+    // Hajm cheklovi: AI va DB yuklamasini nazoratda saqlaydi
+    return { rows: input.rows.slice(0, 2000) };
+  })
+  .handler(async ({ data, context }) => {
+    // Faqat tizimda roli bor xodimlar (AI krediti va katalog ma'lumoti ochiq qolmasin)
+    const { data: hasRole } = await context.supabase.rpc("has_any_role", { _user_id: context.userId });
+    if (!hasRole) throw new Error("Ruxsat yo'q");
     const { rows } = data;
     if (!rows?.length) return { items: [] };
 

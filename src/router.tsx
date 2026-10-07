@@ -60,7 +60,8 @@ export const getRouter = () => {
     context: {},
     scrollRestoration: true,
     defaultPreload: "intent",
-    defaultPreloadStaleTime: 30_000,
+    defaultStaleTime: Infinity,
+    defaultPreloadStaleTime: Infinity,
     defaultErrorComponent: DefaultErrorComponent,
   });
 
